@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-DROPNET SCANNER v2.3
+DROPNET SCANNER v2.4
 Varre faixas de CDNs/provedores e separa os IPs por porta (80 / 443).
+
+Novidades da v2.4:
+  - Gerador de payload: testa várias variações num IP e mostra as que funcionaram (--gerar-payload IP)
+  - Testador de Host/SNI: testa uma lista de hosts com o payload atual (--testar-hosts arquivo.txt --ip IP)
+  - Perfis por rede: salva e carrega modo/host/sni/payload com um nome (--salvar-perfil / --usar-perfil / --listar-perfis)
+  - No assistente de payload (opções 1/2/3), nova opção 4) Gerar
 
 Novidades da v2.3:
   - Ranking de latência: mede os IPs achados 3x e ordena (média, mín, jitter)
@@ -46,7 +52,7 @@ import sys
 import textwrap
 import time
 
-VERSION = "2.3"
+VERSION = "2.4"
 # Pasta fixa para salvar automaticamente os resultados no Android/Termux.
 # O caminho ~/storage/downloads é o atalho criado pelo termux-setup-storage.
 OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "storage", "downloads", "DROPNET-SCANNER")
@@ -1107,8 +1113,8 @@ def _limpar_payload(pl):
     return pl.replace("\\r\\n", "[crlf]").replace("\\n", "[lf]")
 
 
-def pedir_payload(rotulo):
-    """1 e 2 = payloads padrão (só pede o host). 3 = payload manual (colar)."""
+def pedir_payload(rotulo, args=None):
+    """1 e 2 = payloads padrão (só pede o host). 3 = manual (colar). 4 = gerar testando num IP."""
     porta = rotulo.replace("Payload ", "")
     larg = max(24, term_width() - 9)
     print()
@@ -1119,15 +1125,33 @@ def pedir_payload(rotulo):
         for ln in textwrap.wrap(v, larg):
             print(c("2", "      " + ln))
     print(f" {c('1;36', '3)')} {c('1', 'Manual'.ljust(11))} {c('2', '· colar o seu payload')}")
+    print(f" {c('1;36', '4)')} {c('1', 'Gerar'.ljust(11))} {c('2', '· testa variações num IP e escolhe a melhor')}")
     line()
     while True:
         try:
-            esc = input(c("1;36", " ❯ ") + f"{rotulo} [1/2/3]: ").strip()
+            esc = input(c("1;36", " ❯ ") + f"{rotulo} [1/2/3/4]: ").strip()
         except EOFError:
             sys.exit("Payload nao informado.")
         if esc in PAYLOADS_PADRAO:
             USOU_PRESET[0] = True
             return PAYLOADS_PADRAO[esc]
+        if esc == "4":
+            ip = pedir_texto("IP já conhecido para testar")
+            porta_txt = porta if porta.isdigit() else ("443" if "443" in rotulo else "80")
+            a2 = copy.copy(args) if args else argparse.Namespace()
+            a2.ip, a2.porta_gerar = ip, int(porta_txt)
+            a2.host = getattr(a2, "host", None) or pedir_texto("Host/SNI para testar")
+            a2.sni = a2.host
+            a2.status = getattr(a2, "status", None) or "101;200"
+            a2.proxy = getattr(a2, "proxy", None)
+            a2.timeout = getattr(a2, "timeout", 2.0) or 2.0
+            a2.tls_version = getattr(a2, "tls_version", None)
+            melhor = asyncio.run(gerar_payload(a2))
+            if melhor:
+                esc2 = input(c("1;36", " ❯ ") + "Usar esse payload? (s/n) [s]: ").strip().lower()
+                if esc2 != "n":
+                    return melhor
+            continue
         if esc == "3":
             print(c("2", f" Tokens: {TOKENS_AJUDA}"))
             while True:
@@ -1158,9 +1182,9 @@ def pedir_texto(rotulo):
 def aplicar_padroes_combo(args):
     """Só preenche a SNI padrão. O payload é sempre colado manualmente."""
     if args.modo in ("ssl", "ambos") and args.payload == DEFAULT_PAYLOAD:
-        args.payload = pedir_payload("Payload 443")
+        args.payload = pedir_payload("Payload 443", args)
     if args.modo in ("ssh", "ambos") and not getattr(args, "payload_ssh", None):
-        args.payload_ssh = pedir_payload("Payload 80")
+        args.payload_ssh = pedir_payload("Payload 80", args)
     if USOU_PRESET[0] and not getattr(args, "host", None):
         args.host = pedir_texto("Host (vai no payload)")
     if args.modo in ("ssl", "ambos") and not args.sni:
@@ -1181,6 +1205,207 @@ def make_ssl_ctx(args):
             except ssl.SSLError:
                 pass
     return ctx
+
+
+# ============== gerador de payload / testador de host-sni / perfis ==============
+# Em vez de montar o payload na mão, o script testa várias variações numa
+# rede/IP de verdade e mostra quais funcionaram (status esperado + latência).
+PAYLOAD_METODOS = ["GET", "HEAD"]
+PAYLOAD_CAMINHOS = ["/", "/ws"]
+PAYLOAD_QUEBRAS = ["[crlf]", "[lf]"]
+PAYLOAD_CABECALHOS = [
+    ("sem upgrade", ""),
+    ("upgrade/keep-alive", "Upgrade: websocket[Q]Connection: Keep-Alive[Q]"),
+    ("connection/upgrade", "Connection: Upgrade[Q]Upgrade: Websocket[Q]"),
+]
+
+
+def gerar_variantes_payload(ua=True):
+    """Monta os modelos de payload a testar (ainda com tokens [host]/[crlf]/[lf])."""
+    variantes = []
+    for metodo in PAYLOAD_METODOS:
+        for caminho in PAYLOAD_CAMINHOS:
+            for quebra in PAYLOAD_QUEBRAS:
+                for nome_cab, cab in PAYLOAD_CABECALHOS:
+                    corpo = (f"{metodo} {caminho} HTTP/1.1[Q]Host: [host][Q]" + cab)
+                    if ua:
+                        corpo += "User-Agent: [ua][Q]"
+                    corpo += "[Q]"
+                    corpo = corpo.replace("[Q]", quebra)
+                    rotulo = f"{metodo} {caminho} {quebra.strip('[]')} · {nome_cab}"
+                    variantes.append((rotulo, corpo))
+    return variantes
+
+
+async def testar_um_payload(ip, porta, template, args, ssl_ctx, ranges, use_tls, tries=2):
+    """Testa UM template de payload no IP. Retorna (info, ms) do melhor try, ou None."""
+    for _ in range(max(1, tries)):
+        w = None
+        t0 = time.monotonic()
+        try:
+            r, w = await asyncio.wait_for(
+                open_conn(ip, args, ssl_ctx if use_tls else None, porta, use_tls),
+                args.timeout * 2 if use_tls else args.timeout)
+            payload = build_payload(args, ip, template)
+            partes = [p for p in payload.split(b"[split]") if p]
+            for i, parte in enumerate(partes):
+                w.write(parte)
+                await w.drain()
+                if i < len(partes) - 1:
+                    try:
+                        await asyncio.wait_for(r.read(65536), min(args.timeout, 1.0))
+                    except asyncio.TimeoutError:
+                        pass
+            raw = await asyncio.wait_for(r.readline(), args.timeout)
+            linha = raw.decode("latin-1", "replace").strip()
+            ms = int((time.monotonic() - t0) * 1000)
+            m = re.match(r"HTTP/\d(?:\.\d)?\s+(\d{3})", linha)
+            if linha.startswith("SSH-"):
+                return linha[:40], ms
+            if m and status_ok(int(m.group(1)), ranges):
+                return linha, ms
+        except Exception:
+            pass
+        finally:
+            await fechar(w)
+    return None
+
+
+async def gerar_payload(args):
+    """Testa várias variações de payload num IP e mostra as que funcionaram."""
+    ip = args.ip
+    porta = args.porta_gerar
+    use_tls = porta == 443
+    ssl_ctx = make_ssl_ctx(args) if use_tls else None
+    ranges = parse_status_spec(args.status)
+    variantes = gerar_variantes_payload()
+    print()
+    print(c("1", f" Gerando payload para {ip}:{porta} · Host/SNI: {args.host or args.sni or ip}"))
+    print(c("2", f" Testando {len(variantes)} variações..."))
+    print()
+    sem = asyncio.Semaphore(12)
+
+    async def um(rotulo, template):
+        async with sem:
+            res = await testar_um_payload(ip, porta, template, args, ssl_ctx, ranges, use_tls)
+        if res:
+            print(f" {c('1;32', '✔')} {c('1', rotulo.ljust(32))} {c('32', res[0][:30])}  {c('2', f'{res[1]}ms')}")
+        return (rotulo, template, res)
+
+    resultados = await asyncio.gather(*(um(r, t) for r, t in variantes))
+    ok = [(r, t, res) for r, t, res in resultados if res]
+    ok.sort(key=lambda x: x[2][1])
+
+    print()
+    line("═", "1;36")
+    print(c("1;97", " RESULTADO"))
+    line("═", "1;36")
+    if not ok:
+        print(c("33", " Nenhuma variação funcionou. Confira Host/SNI e a porta."))
+        print()
+        return None
+    print(f" {c('1;32', str(len(ok)))} de {len(variantes)} variações funcionaram")
+    print()
+    for rotulo, _, res in ok[:8]:
+        print(f" {c('1', rotulo.ljust(32))} {c('2', f'{res[1]}ms')}  {res[0][:40]}")
+    melhor_rotulo, melhor_template, melhor_res = ok[0]
+    print()
+    print(c("1", " Melhor payload:") + f"  {c('36', melhor_rotulo)}  ({melhor_res[1]}ms)")
+    for ln in textwrap.wrap(melhor_template, max(24, term_width() - 3)):
+        print(c("2", "   " + ln))
+    print()
+    return melhor_template
+
+
+async def testar_hosts(args):
+    """Testa uma lista de Host/SNI (um por linha) com o payload atual num IP:porta."""
+    ip, porta = args.ip, args.porta_gerar
+    use_tls = porta == 443
+    ssl_ctx = make_ssl_ctx(args) if use_tls else None
+    ranges = parse_status_spec(args.status)
+    hosts = [h for h in iter_hosts(args.testar_hosts)]
+    print()
+    print(c("1", f" Testando {len(hosts)} hosts em {ip}:{porta}"))
+    print()
+    sem = asyncio.Semaphore(15)
+    ok = []
+
+    async def um(host):
+        a2 = copy.copy(args)
+        a2.host, a2.sni = host, host
+        async with sem:
+            res = await testar_um_payload(ip, porta, args.payload, a2, ssl_ctx, ranges, use_tls)
+        if res:
+            ok.append((host, res))
+            print(f" {c('1;32', '✔')} {c('1', host.ljust(28))} {c('32', res[0][:30])}  {c('2', f'{res[1]}ms')}")
+
+    await asyncio.gather(*(um(h) for h in hosts))
+    ok.sort(key=lambda x: x[1][1])
+    print()
+    line("═", "1;36")
+    print(c("1;97", " RESULTADO"))
+    line("═", "1;36")
+    if not ok:
+        print(c("33", " Nenhum host funcionou com esse payload nesse IP."))
+        print()
+        return
+    print(f" {c('1;32', str(len(ok)))} de {len(hosts)} hosts funcionaram")
+    caminho = output_path((args.output or "dropnet_scan") + "_hosts_ok.txt")
+    with open(caminho, "w", encoding="utf-8") as f:
+        for host, res in ok:
+            f.write(f"{host};{res[1]}ms;{res[0]}\n")
+    print()
+    print(c("1", " Arquivo salvo:"))
+    print(f"   {c('36', caminho)} {c('2', f'({len(ok)})')}")
+    print()
+
+
+# ----------------------------- perfis por rede -----------------------------
+def perfis_path():
+    return output_path("perfis.json")
+
+
+def perfis_carregar_todos():
+    try:
+        with open(perfis_path(), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def perfil_salvar(args, nome):
+    perfis = perfis_carregar_todos()
+    perfis[nome] = {
+        "modo": args.modo, "host": args.host, "sni": args.sni,
+        "payload": args.payload, "payload_ssh": getattr(args, "payload_ssh", ""),
+        "status": args.status,
+    }
+    with open(perfis_path(), "w", encoding="utf-8") as f:
+        json.dump(perfis, f, ensure_ascii=False, indent=2)
+    print(c("1;32", f" Perfil '{nome}' salvo em {perfis_path()}"))
+
+
+def perfil_carregar(args, nome):
+    perfis = perfis_carregar_todos()
+    if nome not in perfis:
+        sys.exit(f"Perfil '{nome}' não existe. Disponíveis: {', '.join(sorted(perfis)) or '(nenhum)'}")
+    p = perfis[nome]
+    args.modo = p["modo"]
+    args.host, args.sni = p["host"], p["sni"]
+    args.payload = p["payload"]
+    args.payload_ssh = p.get("payload_ssh", "")
+    args.status = p["status"]
+    print(c("2", f" Perfil '{nome}' carregado (modo {args.modo})"))
+
+
+def listar_perfis():
+    perfis = perfis_carregar_todos()
+    if not perfis:
+        print(c("33", " Nenhum perfil salvo ainda."))
+        return
+    print(c("1", f" Perfis salvos ({len(perfis)}):"))
+    for nome, p in perfis.items():
+        print(f"   {c('36', nome.ljust(16))} modo {p['modo']}  host/sni: {p.get('host') or p.get('sni') or '-'}")
 
 
 async def probe_combo(target, args, ssl_ctx, ranges, modo, porta):
@@ -1435,8 +1660,8 @@ def ask_busca(args):
     tem_80 = args.modo in ("ssh", "ambos")
 
     etapa("ETAPA 3 · Payload")
-    args.payload = pedir_payload("Payload 443") if tem_tls else DEFAULT_PAYLOAD
-    args.payload_ssh = pedir_payload("Payload 80") if tem_80 else ""
+    args.payload = pedir_payload("Payload 443", args) if tem_tls else DEFAULT_PAYLOAD
+    args.payload_ssh = pedir_payload("Payload 80", args) if tem_80 else ""
 
     etapa("ETAPA 4 · Host, SNI e status")
     usados = ([args.payload] if tem_tls else []) + ([args.payload_ssh] if tem_80 else [])
@@ -1566,7 +1791,7 @@ def interactive(base):
             if args.confirmar:
                 print(c("33", " A confirmação só bate se o Host/SNI forem os certos"))
                 print(c("33", " dessa CDN/operadora (o mesmo valor que funciona na sua VPN)."))
-                args.payload = pedir_payload(f"Payload {args.port}")
+                args.payload = pedir_payload(f"Payload {args.port}", args)
                 args.host = pedir_texto("Host (vai no payload)")
                 args.status = ask("Status de sucesso", args.status)
                 args.tentativas = ask_num("Tentativas por IP", args.tentativas)
@@ -1707,6 +1932,15 @@ def build_parser():
     r.add_argument("--retomar", action="store_true", help="retoma automaticamente o último scan interrompido")
     r.add_argument("--novo", action="store_true", help="ignora o progresso salvo e começa do zero")
     r.add_argument("--no-color", action="store_true", help="sem cores")
+
+    g2 = p.add_argument_group("gerar payload / testar hosts / perfis")
+    g2.add_argument("--gerar-payload", metavar="IP", help="testa várias variações de payload nesse IP e mostra as que funcionaram")
+    g2.add_argument("--testar-hosts", metavar="ARQUIVO", help="testa uma lista de hosts/SNI (um por linha) com o --payload atual; use com --ip")
+    g2.add_argument("--ip", help="IP alvo para --testar-hosts")
+    g2.add_argument("--porta-gerar", type=int, default=443, help="porta usada por --gerar-payload / --testar-hosts")
+    g2.add_argument("--salvar-perfil", metavar="NOME", help="salva modo/host/sni/payload atuais como um perfil de rede")
+    g2.add_argument("--usar-perfil", metavar="NOME", help="carrega um perfil salvo (modo/host/sni/payload) antes de rodar")
+    g2.add_argument("--listar-perfis", action="store_true", help="lista os perfis salvos e sai")
     return p
 
 
@@ -1721,6 +1955,36 @@ def main():
         except KeyboardInterrupt:
             pass
         return
+
+    if args.listar_perfis:
+        listar_perfis()
+        return
+
+    if args.salvar_perfil:
+        if not args.modo:
+            sys.exit("--salvar-perfil precisa de --modo (ssl/ssh/ambos) com payload/host/sni definidos.")
+        perfil_salvar(args, args.salvar_perfil)
+        return
+
+    if args.gerar_payload:
+        args.ip = args.gerar_payload
+        try:
+            asyncio.run(gerar_payload(args))
+        except KeyboardInterrupt:
+            pass
+        return
+
+    if args.testar_hosts:
+        if not args.ip:
+            sys.exit("--testar-hosts precisa de --ip IP.")
+        try:
+            asyncio.run(testar_hosts(args))
+        except KeyboardInterrupt:
+            pass
+        return
+
+    if args.usar_perfil:
+        perfil_carregar(args, args.usar_perfil)
 
     if not (args.cidr or args.cidr_file or args.provider or args.hosts):
         try:
