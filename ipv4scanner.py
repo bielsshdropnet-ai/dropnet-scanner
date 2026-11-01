@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-DROPNET SCANNER v2.2
+DROPNET SCANNER v2.3
 Varre faixas de CDNs/provedores e separa os IPs por porta (80 / 443).
+
+Novidades da v2.3:
+  - Ranking de latência: mede os IPs achados 3x e ordena (média, mín, jitter)
+  - Retomar scan: Ctrl+C ou Termux fechado não perde o progresso
+  - Modo rápido (opcional, --rapido): amostra cada /24 e só varre blocos que responderam
 
 Novidades da v2.2:
   - TLS correto na 443 na revisão dos IPs sem resposta
@@ -28,7 +33,9 @@ import asyncio
 import bisect
 import copy
 from collections import Counter
+import hashlib
 import ipaddress
+import itertools
 import json
 import os
 import random
@@ -39,7 +46,7 @@ import sys
 import textwrap
 import time
 
-VERSION = "2.2"
+VERSION = "2.3"
 # Pasta fixa para salvar automaticamente os resultados no Android/Termux.
 # O caminho ~/storage/downloads é o atalho criado pelo termux-setup-storage.
 OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "storage", "downloads", "DROPNET-SCANNER")
@@ -105,11 +112,262 @@ def salvar_parcial(args, linha):
     try:
         if nome not in PARCIAL:
             PARCIAL[nome] = output_path(nome)
-            open(PARCIAL[nome], "w", encoding="utf-8").close()
+            open(PARCIAL[nome], "a" if PARCIAL_MANTER[0] else "w", encoding="utf-8").close()
         with open(PARCIAL[nome], "a", encoding="utf-8") as f:
             f.write(linha + "\n")
     except OSError:
         pass
+
+
+PARCIAL_MANTER = [False]   # True ao retomar: não apaga o parcial anterior
+RANK_MAX = 300             # máximo de IPs medidos no ranking
+RAPIDO = Counter()         # estatísticas do modo rápido
+CHECKPOINT_FORMATO = 1
+
+
+# ----------------------------- modo rápido -----------------------------
+def rapido_ativo(args):
+    """Modo rápido só vale para faixas completas (não com --hosts nem limite de IPs)."""
+    return bool(getattr(args, "rapido", False)) and not args.hosts and not args.max_ips
+
+
+def aviso_rapido(args):
+    if not getattr(args, "rapido", False):
+        return
+    if not rapido_ativo(args):
+        print(c("33", " Modo rápido ignorado (não vale com --hosts ou limite de IPs)."))
+        return
+    print(c("33", " Modo rápido: blocos /24 sem resposta nas amostras são pulados."))
+    print(c("33", " Pode perder IPs isolados. Retomar scan fica desativado."))
+
+
+def mostrar_rapido():
+    if not RAPIDO:
+        return
+    line("─", "2")
+    print(c("1", " Modo rápido"))
+    print(f"   {RAPIDO['blocos_varridos']} blocos varridos · {RAPIDO['blocos_pulados']} pulados")
+    print(c("2", f"   {fmt(RAPIDO['ips_pulados'])} IPs não testados"))
+    print()
+
+
+async def aiter_sync(it):
+    """Adapta um iterador comum para 'async for'."""
+    for x in it:
+        yield x
+
+
+async def alvos_rapido(args, blocos, portas, pular):
+    """Fase 1: testa algumas amostras de cada bloco /24.
+    Fase 2: só entrega os IPs dos blocos em que alguma amostra respondeu."""
+    amostras = max(1, getattr(args, "rapido_amostras", 3))
+    simultaneos = max(5, args.threads // max(1, amostras * len(portas)))
+    fila = asyncio.Queue(maxsize=1000)
+    FIM = object()
+    it = iter(blocos)
+
+    async def sondar():
+        for bloco in it:
+            ips = [str(ip) for ip in bloco]
+            amostra = random.sample(ips, min(amostras, len(ips)))
+            vivos = await asyncio.gather(*(probe_tcp(ip, args, portas) for ip in amostra))
+            if any(vivos):
+                RAPIDO["blocos_varridos"] += 1
+                for ip in ips:
+                    await fila.put(ip)
+            else:
+                RAPIDO["blocos_pulados"] += 1
+                RAPIDO["ips_pulados"] += len(ips)
+                pular(len(ips))
+
+    async def encerrar(tarefas):
+        await asyncio.gather(*tarefas, return_exceptions=True)
+        await fila.put(FIM)
+
+    tarefas = [asyncio.create_task(sondar()) for _ in range(simultaneos)]
+    fim = asyncio.create_task(encerrar(tarefas))
+    try:
+        while True:
+            ip = await fila.get()
+            if ip is FIM:
+                break
+            yield ip
+    finally:
+        fim.cancel()
+        for t in tarefas:
+            t.cancel()
+
+
+def build_alvos(args, portas, pular, skip, rng):
+    """Devolve (iterador assíncrono de IPs, total). Aplica retomada e modo rápido."""
+    targets, total = build_targets(args, rng)
+    if rapido_ativo(args):
+        blocos = blocos_24(coletar_cidrs(args), args.shuffle, rng)
+        return alvos_rapido(args, blocos, portas, pular), total
+    if skip:
+        targets = itertools.islice(targets, skip, None)
+    return aiter_sync(targets), total
+
+
+# ----------------------------- retomar scan -----------------------------
+def chave_scan(args, tag):
+    """Identifica a configuração do scan: só retoma se for exatamente a mesma."""
+    partes = [
+        CHECKPOINT_FORMATO, tag,
+        args.hosts if args.hosts else sorted(coletar_cidrs(args)),
+        args.max_ips, bool(args.shuffle), str(args.ports), args.port, bool(args.tcp),
+        bool(getattr(args, "confirmar", False)), getattr(args, "modo", None),
+        getattr(args, "payload", ""), getattr(args, "payload_ssh", ""),
+        getattr(args, "host", None), getattr(args, "sni", None),
+        args.status, bool(args.tls),
+    ]
+    return hashlib.sha1(repr(partes).encode()).hexdigest()
+
+
+class Checkpoint:
+    """Guarda o progresso do scan para retomar depois (Ctrl+C / Termux fechado)."""
+
+    def __init__(self, args, tag):
+        self.ativo = not rapido_ativo(args)   # o modo rápido não tem ordem fixa
+        self.retomou = False
+        self.idx = 0
+        self.hits = []
+        self.seed = random.randrange(1 << 30)
+        self.ultimo = time.monotonic()
+        if not self.ativo:
+            return
+        self.path = output_path((args.output or "dropnet_scan") + "_retomar.json")
+        self.key = chave_scan(args, tag)
+        self._carregar(args)
+
+    def _carregar(self, args):
+        if getattr(args, "novo", False):
+            return
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            return
+        if d.get("key") != self.key or d.get("idx", 0) <= 0:
+            return
+        if not getattr(args, "retomar", False):
+            if not sys.stdin.isatty():
+                return
+            print()
+            print(c("33", f" Scan anterior parou no IP nº {fmt(d['idx'])} "
+                          f"({len(d.get('hits', []))} achados guardados)."))
+            try:
+                r = input(c("1;36", " ❯ ") + "Retomar de onde parou? (s/n) [s]: ").strip().lower()
+            except EOFError:
+                return
+            if r == "n":
+                return
+        self.seed, self.idx = d["seed"], d["idx"]
+        self.hits, self.retomou = d.get("hits", []), True
+        print(c("2", f" Retomando do IP nº {fmt(self.idx)} · {len(self.hits)} achados guardados"))
+
+    def devido(self):
+        return self.ativo and time.monotonic() - self.ultimo >= 5
+
+    def salvar(self, idx, hits, force=False):
+        if not self.ativo:
+            return
+        self.ultimo = time.monotonic()
+        d = {"key": self.key, "seed": self.seed, "idx": idx, "hits": [list(h) for h in hits]}
+        tmp = self.path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(d, f)
+            os.replace(tmp, self.path)
+        except OSError:
+            pass
+
+    def concluir(self):
+        if self.ativo:
+            try:
+                os.remove(self.path)
+            except OSError:
+                pass
+
+
+# ----------------------------- ranking de latência -----------------------------
+async def tcp_ms(ip, args, porta):
+    t0 = time.monotonic()
+    w = None
+    try:
+        _, w = await asyncio.wait_for(
+            open_conn(ip, args, None, porta, use_tls=False), args.timeout)
+        return int((time.monotonic() - t0) * 1000)
+    except Exception:
+        return None
+    finally:
+        await fechar(w)
+
+
+async def http_ms(ip, args, ssl_ctx, ranges, porta):
+    r = await probe_http(ip, args, ssl_ctx, ranges, port=porta)
+    return r[3] if r else None
+
+
+async def combo_ms(ip, args, ssl_ctx, ranges, modo, porta):
+    r = await probe_combo(ip, args, ssl_ctx, ranges, modo, porta)
+    return r[1] if r else None
+
+
+async def ranquear(itens, rodadas=3):
+    """itens: [(ip, rotulo, fabrica)] onde fabrica() devolve uma corrotina -> ms ou None.
+    Mede cada IP algumas vezes e ordena do melhor para o pior."""
+    itens = itens[:RANK_MAX]
+    if not itens:
+        return []
+    print(c("2", f" Medindo latência de {len(itens)} IPs..."), flush=True)
+    sem = asyncio.Semaphore(30)
+
+    async def um(ip, rotulo, fab):
+        amostras = []
+        async with sem:
+            for _ in range(rodadas):
+                ms = await fab()
+                if ms is not None:
+                    amostras.append(ms)
+                await asyncio.sleep(0.05)
+        if not amostras:
+            return None
+        return {"ip": ip, "rotulo": rotulo, "media": int(sum(amostras) / len(amostras)),
+                "minimo": min(amostras), "jitter": max(amostras) - min(amostras),
+                "ok": len(amostras), "de": rodadas}
+
+    res = await asyncio.gather(*(um(*i) for i in itens), return_exceptions=True)
+    res = [r for r in res if isinstance(r, dict)]
+    res.sort(key=lambda r: (-r["ok"], r["media"], r["jitter"]))
+    return res
+
+
+def mostrar_ranking(args, ranking):
+    if not ranking:
+        print(c("33", " Ranking: nenhum IP respondeu na medição."))
+        print()
+        return
+    print()
+    line("═", "1;36")
+    print(c("1;97", " RANKING DE LATÊNCIA"))
+    line("═", "1;36")
+    print(c("2", f" {'IP':<15} {'cfg':<7} {'média':>6} ok"))
+    for r in ranking[:10]:
+        cor = "1;32" if r["ok"] == r["de"] else "33"
+        print(f" {c('1', r['ip'].ljust(15))} {r['rotulo']:<7} {r['media']:>4}ms "
+              f"{c(cor, str(r['ok']) + '/' + str(r['de']))}")
+    if len(ranking) > 10:
+        print(c("2", f"   ... +{len(ranking) - 10} no arquivo"))
+    caminho = output_path((args.output or "dropnet_scan") + "_ranking.txt")
+    with open(caminho, "w", encoding="utf-8") as f:
+        for r in ranking:
+            f.write(f"{r['ip']};{r['rotulo']};{r['media']}ms;min {r['minimo']}ms;"
+                    f"jitter {r['jitter']}ms;{r['ok']}/{r['de']}\n")
+    print()
+    print(c("1", " Ranking salvo:"))
+    print(f"   {c('36', caminho)} {c('2', f'({len(ranking)})')}")
+    print()
 
 
 # ============================ visual ============================
@@ -250,9 +508,28 @@ def total_ips(cidrs):
     return sum(n.num_addresses for n in parse_nets(cidrs))
 
 
-def iter_targets(cidrs, max_ips, shuffle):
+def dividir_24(nets, rng=None, embaralhar=True):
+    """Quebra as faixas em blocos /24 (e embaralha a ordem dos blocos)."""
+    blocos = []
+    for net in nets:
+        if net.prefixlen < 24:
+            blocos.extend(net.subnets(new_prefix=24))
+        else:
+            blocos.append(net)
+    if embaralhar:
+        (rng or random).shuffle(blocos)
+    return blocos
+
+
+def blocos_24(cidrs, shuffle, rng=None):
+    return dividir_24(parse_nets(cidrs), rng, shuffle)
+
+
+def iter_targets(cidrs, max_ips, shuffle, rng=None):
     """Gera IPs sem carregar tudo na memória. Com limite, sorteia IPs
-    espalhados por TODAS as faixas."""
+    espalhados por TODAS as faixas. Com rng fixo, a ordem é repetível
+    (necessário para retomar um scan)."""
+    rng = rng or random
     nets = parse_nets(cidrs)
     sizes = [n.num_addresses for n in nets]
     total = sum(sizes)
@@ -261,21 +538,14 @@ def iter_targets(cidrs, max_ips, shuffle):
         for sz in sizes:
             starts.append(acc)
             acc += sz
-        for off in sorted(random.sample(range(total), max_ips)):
+        for off in sorted(rng.sample(range(total), max_ips)):
             k = bisect.bisect_right(starts, off) - 1
             yield str(nets[k][off - starts[k]])
         return
     if shuffle:
         # Embaralha por blocos /24: espalha a carga e evita rate limit
         # por varrer uma faixa inteira em sequência.
-        blocos = []
-        for net in nets:
-            if net.prefixlen < 24:
-                blocos.extend(net.subnets(new_prefix=24))
-            else:
-                blocos.append(net)
-        random.shuffle(blocos)
-        nets = blocos
+        nets = dividir_24(nets, rng, True)
     for net in nets:
         for ip in net:
             yield str(ip)
@@ -410,9 +680,7 @@ def resolve_ports(args):
     return [args.port]
 
 
-def build_targets(args):
-    if args.hosts:
-        return iter_hosts(args.hosts), None
+def coletar_cidrs(args):
     cidrs = list(args.cidr or [])
     if args.cidr_file:
         cidrs += list(iter_hosts(args.cidr_file))
@@ -420,10 +688,17 @@ def build_targets(args):
         cidrs += provider_cidrs(args.providers, args.provider)
     if not cidrs:
         sys.exit("Informe --cidr, --cidr-file, --provider ou --hosts.")
+    return cidrs
+
+
+def build_targets(args, rng=None):
+    if args.hosts:
+        return iter_hosts(args.hosts), None
+    cidrs = coletar_cidrs(args)
     tot = total_ips(cidrs)
     if args.max_ips and args.max_ips < tot:
         tot = args.max_ips
-    return iter_targets(cidrs, args.max_ips, args.shuffle), tot
+    return iter_targets(cidrs, args.max_ips, args.shuffle, rng), tot
 
 
 def progress_line(done, total, oks, start, extra=""):
@@ -445,6 +720,7 @@ async def run(args):
     FAIL.clear()
     SEEN.clear()
     PARCIAL.clear()
+    RAPIDO.clear()
 
     nofile = raise_nofile()
     por_ip = len(ports) if args.tcp else 1
@@ -459,16 +735,27 @@ async def run(args):
     if precisa_tls:
         ssl_ctx = make_ssl_ctx(args)
 
-    targets, total = build_targets(args)
+    aviso_rapido(args)
+    cp = Checkpoint(args, "run")
+    PARCIAL_MANTER[0] = cp.retomou
+    skip = cp.idx
+    results = [(h[0], list(h[1]), h[2], h[3]) for h in cp.hits]   # (ip, ports, info, ms)
+    vistos = {r[0] for r in results}
+    done = skip
+    n_abertos = 0
+    interrupted = False
+    last_draw = 0.0
+    start = time.monotonic()
+
+    def pular(n):
+        nonlocal done
+        done += n
+
+    portas_amostra = ports if args.tcp else [args.port]
+    targets, total = build_alvos(args, portas_amostra, pular, skip, random.Random(cp.seed))
     sem = asyncio.Semaphore(threads)
-    results = []          # (ip, ports, info, ms)
     rastrear_tudo = args.tcp and total and total <= RETRY_TOTAL_LIMIT
     nunca_respondeu = set() if rastrear_tudo else None
-    done = 0
-    start = time.monotonic()
-    last_draw = 0.0
-    interrupted = False
-    n_abertos = 0
 
     def redraw(force=False):
         nonlocal last_draw
@@ -528,8 +815,10 @@ async def run(args):
                 nunca_respondeu.discard(t)
         done += 1
         if res:
-            results.append(res)
-            show_hit(res)
+            if res[0] not in vistos:
+                vistos.add(res[0])
+                results.append(res)
+                show_hit(res)
             redraw(True)
         else:
             redraw()
@@ -543,24 +832,35 @@ async def run(args):
         line("─", "2")
 
     tasks = set()
+    pend = set()          # posições (na ordem do scan) ainda em andamento
+    enviados = skip       # quantos alvos já foram despachados (contando os pulados na retomada)
     try:
-        for t in targets:
+        async for t in targets:
             await sem.acquire()
+            pos = enviados
+            enviados += 1
+            pend.add(pos)
             tk = asyncio.create_task(worker(t))
             tasks.add(tk)
             tk.add_done_callback(tasks.discard)
+            tk.add_done_callback(lambda _f, p=pos: pend.discard(p))
             # libera a vaga SEMPRE que a task termina (mesmo se for cancelada)
             tk.add_done_callback(lambda _f: sem.release())
+            if cp.devido():
+                cp.salvar(min(pend) if pend else enviados, results)
         while tasks:
             await asyncio.wait(set(tasks))
     except (KeyboardInterrupt, asyncio.CancelledError):
         interrupted = True
+        cp.salvar(min(pend) if pend else enviados, results, force=True)
         for tk in list(tasks):
             tk.cancel()
         await asyncio.gather(*list(tasks), return_exceptions=True)
 
     if UI.color:
         sys.stdout.write("\r\033[K")
+    if not interrupted:
+        cp.concluir()
 
     # 2ª chance: refaz do zero quem NUNCA respondeu em nenhuma porta
     # (timeout de rede derruba conexão real; sem isso esses IPs se perdem)
@@ -585,19 +885,14 @@ async def run(args):
                         if ok:
                             res2 = (ip, [p], ok[2], ok[3]) if res2 is None else (
                                 ip, res2[1] + [p], res2[2] + " | " + ok[2], max(res2[3], ok[3]))
-                    if res2:
-                        results.append(res2)
-                        show_hit(res2)
                 elif args.tcp:
                     res2 = await probe_tcp(ip, args, ports)
-                    if res2:
-                        results.append(res2)
-                        show_hit(res2)
                 else:
                     res2 = await probe_http(ip, args, ssl_ctx, ranges, tries=2)
-                    if res2:
-                        results.append(res2)
-                        show_hit(res2)
+                if res2 and res2[0] not in vistos:
+                    vistos.add(res2[0])
+                    results.append(res2)
+                    show_hit(res2)
 
         try:
             await asyncio.gather(*(segunda_chance(ip) for ip in alvo))
@@ -636,7 +931,26 @@ async def run(args):
             for r in results:
                 r[1].sort()
 
-    summary(args, ports, results, done, time.monotonic() - start, interrupted, n_abertos)
+    summary(args, ports, results, done, time.monotonic() - start, interrupted, n_abertos,
+            base_done=skip)
+    mostrar_rapido()
+    if interrupted and cp.ativo:
+        print(c("33", " Progresso salvo. Rode de novo com as mesmas opções para retomar."))
+        print()
+
+    if getattr(args, "ranking", False) and results and not interrupted:
+        itens = []
+        for r in results:
+            if args.tcp:
+                for p in r[1]:
+                    itens.append((r[0], str(p), lambda ip=r[0], p=p: tcp_ms(ip, args, p)))
+            else:
+                p0 = r[1][0]
+                itens.append((r[0], str(p0), lambda ip=r[0], p=p0: http_ms(ip, args, ssl_ctx, ranges, p)))
+        try:
+            mostrar_ranking(args, await ranquear(itens))
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            pass
 
 
 def save_lists(args, ports, results):
@@ -660,13 +974,13 @@ def save_lists(args, ports, results):
     return saved
 
 
-def summary(args, ports, results, done, dur, interrupted, n_abertos=0):
+def summary(args, ports, results, done, dur, interrupted, n_abertos=0, base_done=0):
     print()
     line("═", "1;36")
     titulo = "RESULTADO (interrompido)" if interrupted else "RESULTADO"
     print(c("1;97", f" {titulo}"))
     line("═", "1;36")
-    rate = done / dur if dur > 0 else 0
+    rate = (done - base_done) / dur if dur > 0 else 0
     print(f" {c('2', 'Testados')}  {fmt(done)}    {c('2', 'Tempo')}  {dur:.0f}s    {c('2', 'Vel.')}  {rate:.0f} ip/s")
     print()
 
@@ -919,16 +1233,29 @@ async def run_combo(args):
     combos = build_combos(args)
     COMBO_SEEN.clear()
     PARCIAL.clear()
+    RAPIDO.clear()
     ssl_ctx = make_ssl_ctx(args) if any(m == "ssl" for m, _ in combos) else None
     nofile = raise_nofile()
     threads = max(1, min(args.threads, (nofile - 64) // len(combos)))
-    targets, total = build_targets(args)
-    sem = asyncio.Semaphore(threads)
-    hits = []          # (ip, modo, porta, info, ms)
-    done = 0
-    start = time.monotonic()
-    last_draw = 0.0
+
+    aviso_rapido(args)
+    cp = Checkpoint(args, "combo")
+    PARCIAL_MANTER[0] = cp.retomou
+    skip = cp.idx
+    hits = [tuple(h) for h in cp.hits]          # (ip, modo, porta, info, ms)
+    vistos = {(h[0], h[1], h[2]) for h in hits}
+    done = skip
     interrupted = False
+    last_draw = 0.0
+    start = time.monotonic()
+
+    def pular(n):
+        nonlocal done
+        done += n
+
+    targets, total = build_alvos(args, [p for _, p in combos], pular, skip,
+                                 random.Random(cp.seed))
+    sem = asyncio.Semaphore(threads)
 
     def redraw(force=False):
         nonlocal last_draw
@@ -956,7 +1283,8 @@ async def run_combo(args):
         done += 1
         achou = False
         for (m, p), ok in zip(combos, res):
-            if ok:
+            if ok and (ip, m, p) not in vistos:
+                vistos.add((ip, m, p))
                 achou = True
                 hits.append((ip, m, p, ok[0], ok[1]))
                 show_hit(ip, m, p, ok[0], ok[1])
@@ -965,33 +1293,58 @@ async def run_combo(args):
             print(f"... {done} testados, {len(hits)} ok", flush=True)
 
     tasks = set()
+    pend = set()
+    enviados = skip
     try:
-        for t in targets:
+        async for t in targets:
             await sem.acquire()
+            pos = enviados
+            enviados += 1
+            pend.add(pos)
             tk = asyncio.create_task(worker(t))
             tasks.add(tk)
             tk.add_done_callback(tasks.discard)
+            tk.add_done_callback(lambda _f, p=pos: pend.discard(p))
             # libera a vaga SEMPRE que a task termina (mesmo se for cancelada)
             tk.add_done_callback(lambda _f: sem.release())
+            if cp.devido():
+                cp.salvar(min(pend) if pend else enviados, hits)
         while tasks:
             await asyncio.wait(set(tasks))
     except (KeyboardInterrupt, asyncio.CancelledError):
         interrupted = True
+        cp.salvar(min(pend) if pend else enviados, hits, force=True)
         for tk in list(tasks):
             tk.cancel()
         await asyncio.gather(*list(tasks), return_exceptions=True)
 
     if UI.color:
         sys.stdout.write("\r\033[K")
-    summary_combo(args, combos, hits, done, time.monotonic() - start, interrupted)
+    if not interrupted:
+        cp.concluir()
+    summary_combo(args, combos, hits, done, time.monotonic() - start, interrupted,
+                  base_done=skip)
+    mostrar_rapido()
+    if interrupted and cp.ativo:
+        print(c("33", " Progresso salvo. Rode de novo com as mesmas opções para retomar."))
+        print()
+
+    if getattr(args, "ranking", False) and hits and not interrupted:
+        itens = [(h[0], f"{h[1]}:{h[2]}",
+                  lambda ip=h[0], m=h[1], p=h[2]: combo_ms(ip, args, ssl_ctx, ranges, m, p))
+                 for h in hits]
+        try:
+            mostrar_ranking(args, await ranquear(itens))
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            pass
 
 
-def summary_combo(args, combos, hits, done, dur, interrupted):
+def summary_combo(args, combos, hits, done, dur, interrupted, base_done=0):
     print()
     line("═", "1;36")
     print(c("1;97", " RESULTADO (interrompido)" if interrupted else " RESULTADO"))
     line("═", "1;36")
-    rate = done / dur if dur > 0 else 0
+    rate = (done - base_done) / dur if dur > 0 else 0
     print(f" {c('2', 'Testados')}  {fmt(done)}    {c('2', 'Tempo')}  {dur:.0f}s    {c('2', 'Vel.')}  {rate:.0f} ip/s")
     for m, p in combos:
         pl = args.payload_ssh if m == "ssh" else args.payload
@@ -1177,6 +1530,7 @@ def interactive(base):
     args.threads = 150
     args.timeout = 2.0
     args.shuffle = True
+    args.ranking = True
     args.output = "dropnet_" + (nomes[0] if len(nomes) == 1 else "multi")
 
     cidrs = provider_cidrs(args.providers, nomes)
@@ -1219,6 +1573,10 @@ def interactive(base):
         args.max_ips = ask_num("Quantos IPs testar (0 = todos)", args.max_ips)
         args.threads = ask_num("Threads", args.threads)
         args.timeout = ask_num("Timeout (s)", args.timeout, float)
+        args.ranking = ask("Ranking de latência dos IPs achados? (s/n)", "s").lower().startswith("s")
+        if not args.max_ips:
+            print(c("33", " Modo rápido testa amostras de cada /24 e pode perder IPs isolados."))
+            args.rapido = ask("Ativar modo rápido? (s/n)", "n").lower().startswith("s")
 
     amostra = bool(args.max_ips) and args.max_ips < total
     sel = args.max_ips if amostra else total
@@ -1240,6 +1598,8 @@ def interactive(base):
         if args.confirmar:
             info_row("Status", args.status)
     info_row("Threads", f"{args.threads}  ·  timeout {args.timeout:g}s")
+    if rapido_ativo(args):
+        info_row("Modo", c("33", "rápido (2 fases)"))
     line("═", "1;36")
     print(c("2", " Ctrl+C para parar"))
     print()
@@ -1341,6 +1701,11 @@ def build_parser():
     r.add_argument("--confirmar", action="store_true", help="depois do TCP, confirma de verdade (status) em quem abriu porta")
     r.add_argument("--tentativas", type=int, default=1, help="tentativas por IP na confirmação (rede instável)")
     r.add_argument("--diag", nargs="+", metavar="IP", help="testa várias formas de requisição nesses IPs")
+    r.add_argument("--ranking", action="store_true", help="depois do scan, mede a latência dos IPs achados e ordena")
+    r.add_argument("--rapido", action="store_true", help="modo rápido: testa amostras de cada /24 e só varre blocos que responderam (pode perder IPs isolados)")
+    r.add_argument("--rapido-amostras", type=int, default=3, help="amostras por bloco /24 no modo rápido")
+    r.add_argument("--retomar", action="store_true", help="retoma automaticamente o último scan interrompido")
+    r.add_argument("--novo", action="store_true", help="ignora o progresso salvo e começa do zero")
     r.add_argument("--no-color", action="store_true", help="sem cores")
     return p
 
