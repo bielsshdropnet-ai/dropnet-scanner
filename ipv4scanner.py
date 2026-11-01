@@ -30,12 +30,29 @@ import textwrap
 import time
 
 VERSION = "2.1"
-# Pasta fixa para salvar os resultados no armazenamento compartilhado do Android/Termux.
-OUTPUT_DIR = "/storage/emulated/0/Download/DROPNET-SCANNER"
+# Pasta fixa para salvar automaticamente os resultados no Android/Termux.
+# O caminho ~/storage/downloads é o atalho criado pelo termux-setup-storage.
+OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "storage", "downloads", "DROPNET-SCANNER")
 
 def output_path(filename):
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    return os.path.join(OUTPUT_DIR, os.path.basename(filename))
+    """Cria a pasta automaticamente e devolve o caminho do arquivo de saída."""
+    global OUTPUT_DIR
+    candidatos = [
+        OUTPUT_DIR,
+        "/storage/emulated/0/Download/DROPNET-SCANNER",
+    ]
+    ultimo_erro = None
+    for pasta in candidatos:
+        try:
+            os.makedirs(pasta, exist_ok=True)
+            OUTPUT_DIR = pasta
+            return os.path.join(OUTPUT_DIR, os.path.basename(filename))
+        except OSError as erro:
+            ultimo_erro = erro
+    raise OSError(
+        "Não foi possível acessar a pasta de Downloads. "
+        "No Termux, execute termux-setup-storage uma única vez e permita o acesso."
+    ) from ultimo_erro
 
 RETRY_TOTAL_LIMIT = 20000   # até esse tamanho, guarda quem NUNCA respondeu p/ tentar de novo
 
