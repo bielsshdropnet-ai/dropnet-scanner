@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-DROPNET SCANNER v2.4
+DROPNET SCANNER v2.4.1
 Varre faixas de CDNs/provedores e separa os IPs por porta (80 / 443).
+
+Novidades da v2.4.1:
+  - Corrigido: o gerador de payload (opção 4) agora pergunta Host e SNI
+    separados, em vez de usar o mesmo valor para os dois
 
 Novidades da v2.4:
   - Gerador de payload: testa várias variações num IP e mostra as que funcionaram (--gerar-payload IP)
@@ -52,7 +56,7 @@ import sys
 import textwrap
 import time
 
-VERSION = "2.4"
+VERSION = "2.4.1"
 # Pasta fixa para salvar automaticamente os resultados no Android/Termux.
 # O caminho ~/storage/downloads é o atalho criado pelo termux-setup-storage.
 OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "storage", "downloads", "DROPNET-SCANNER")
@@ -1140,8 +1144,15 @@ def pedir_payload(rotulo, args=None):
             porta_txt = porta if porta.isdigit() else ("443" if "443" in rotulo else "80")
             a2 = copy.copy(args) if args else argparse.Namespace()
             a2.ip, a2.porta_gerar = ip, int(porta_txt)
-            a2.host = getattr(a2, "host", None) or pedir_texto("Host/SNI para testar")
-            a2.sni = a2.host
+            # Host (vai no cabeçalho) e SNI (vai no handshake TLS) costumam
+            # ser diferentes num bypass de CDN: pergunta os dois separados.
+            a2.host = getattr(a2, "host", None) or pedir_texto("Host (cabeçalho do payload)")
+            sni_atual = getattr(a2, "sni", None)
+            if int(porta_txt) == 443:
+                sni_txt = input(c("1;36", " ❯ ") + f"SNI (TLS) [Enter = {a2.host}]: ").strip()
+                a2.sni = sni_txt or sni_atual or a2.host
+            else:
+                a2.sni = sni_atual or a2.host
             a2.status = getattr(a2, "status", None) or "101;200"
             a2.proxy = getattr(a2, "proxy", None)
             a2.timeout = getattr(a2, "timeout", 2.0) or 2.0
@@ -1279,8 +1290,14 @@ async def gerar_payload(args):
     ssl_ctx = make_ssl_ctx(args) if use_tls else None
     ranges = parse_status_spec(args.status)
     variantes = gerar_variantes_payload()
+    host_mostrar = args.host or args.sni or ip
+    sni_mostrar = args.sni or args.host or ip
     print()
-    print(c("1", f" Gerando payload para {ip}:{porta} · Host/SNI: {args.host or args.sni or ip}"))
+    print(c("1", f" Gerando payload para {ip}:{porta}"))
+    if use_tls and host_mostrar != sni_mostrar:
+        print(c("2", f" Host: {host_mostrar}   SNI: {sni_mostrar}"))
+    else:
+        print(c("2", f" Host/SNI: {host_mostrar}"))
     print(c("2", f" Testando {len(variantes)} variações..."))
     print()
     sem = asyncio.Semaphore(12)
