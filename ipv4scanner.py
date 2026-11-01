@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-DROPNET SCANNER v2.6
+DROPNET SCANNER v2.6.1
 Varre faixas de CDNs/provedores e separa os IPs por porta (80 / 443).
+
+Novidades da v2.6.1:
+  - Corrigido bug grave: a opção 4 (Gerar) do assistente, quando aberta de
+    dentro do menu da CDN, herdava o status largo do "Só Proxy"
+    (101;200;301-302;400;403;404;426) e aceitava 404/403 como "funcionou".
+    Agora sempre pergunta o status esperado e mostra qual está usando.
 
 Novidades da v2.6:
   - Gerador de payload: de 120 para 432 variações
@@ -69,7 +75,7 @@ import sys
 import textwrap
 import time
 
-VERSION = "2.6"
+VERSION = "2.6.1"
 # Pasta fixa para salvar automaticamente os resultados no Android/Termux.
 # O caminho ~/storage/downloads é o atalho criado pelo termux-setup-storage.
 OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "storage", "downloads", "DROPNET-SCANNER")
@@ -1201,7 +1207,11 @@ def pedir_payload(rotulo, args=None):
                 a2.sni = sni_txt or sni_atual or a2.host
             else:
                 a2.sni = sni_atual or a2.host
-            a2.status = getattr(a2, "status", None) or "101;200"
+            # Pergunta sempre: não reaproveita o status herdado do menu (no
+            # menu da CDN ele costuma vir largo demais, aceitando 404/403
+            # como "deu certo", o que não garante o túnel real abrir).
+            status_txt = input(c("1;36", " ❯ ") + "Status que conta como sucesso [101;200]: ").strip()
+            a2.status = status_txt or "101;200"
             a2.proxy = getattr(a2, "proxy", None)
             a2.timeout = getattr(a2, "timeout", 2.0) or 2.0
             a2.tls_version = getattr(a2, "tls_version", None)
@@ -1356,6 +1366,7 @@ async def gerar_payload(args):
         print(c("2", f" Host: {host_mostrar}   SNI: {sni_mostrar}"))
     else:
         print(c("2", f" Host/SNI: {host_mostrar}"))
+    print(c("2", f" Status aceito como sucesso: {args.status}"))
     print(c("2", f" Testando {len(variantes)} variações (as '+delay' esperam "
                  f"{getattr(args, 'split_delay', 2.0):g}s a mais cada uma)..."))
     print()
