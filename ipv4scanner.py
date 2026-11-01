@@ -1,7 +1,20 @@
 #!/usr/bin/env python3
 """
-DROPNET SCANNER v2.4.1
+DROPNET SCANNER v2.6
 Varre faixas de CDNs/provedores e separa os IPs por porta (80 / 443).
+
+Novidades da v2.6:
+  - Gerador de payload: de 120 para 432 variações
+  - Novos tipos de split: [instant_split] (sem espera) e [delay_split]
+    (espera --split-delay segundos, padrão 2.0) além do [split] de sempre
+  - Novo estilo de cabeçalho: Content-Length falso (9999999999999)
+  - Novo método testado: ACL (além de GET e HEAD)
+
+Novidades da v2.5:
+  - Gerador de payload ampliado: de 24 para 120 variações (5 estilos de
+    cabeçalho × 3 caminhos × 2 métodos × 2 quebras de linha, cada uma com
+    e sem [split] — 1ª requisição no SNI, 2ª no Host real)
+  - Novo token [sni] no payload, separado do [host]
 
 Novidades da v2.4.1:
   - Corrigido: o gerador de payload (opção 4) agora pergunta Host e SNI
@@ -56,7 +69,7 @@ import sys
 import textwrap
 import time
 
-VERSION = "2.4.1"
+VERSION = "2.6"
 # Pasta fixa para salvar automaticamente os resultados no Android/Termux.
 # O caminho ~/storage/downloads é o atalho criado pelo termux-setup-storage.
 OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "storage", "downloads", "DROPNET-SCANNER")
@@ -1079,10 +1092,11 @@ def parse_ports(args):
 
 def build_payload(args, target, texto=None):
     """Monta o payload final (única implementação, usada por todos os modos).
-    Tokens: [crlf] [lf] [host] [ip] [ua] [method] [rotate=a;b]"""
-    host_header = getattr(args, "host", None) or args.sni or target
+    Tokens: [crlf] [lf] [host] [sni] [ip] [ua] [method] [split] [rotate=a;b]"""
+    host_header = getattr(args, "host", None) or getattr(args, "sni", None) or target
+    sni_val = getattr(args, "sni", None) or host_header
     template = (texto or args.payload).replace("[crlf]", "\r\n").replace("[lf]", "\n")
-    template = template.replace("[host]", host_header).replace("[ip]", target)
+    template = template.replace("[host]", host_header).replace("[sni]", sni_val).replace("[ip]", target)
     template = template.replace("[ua]", APP_UA).replace("[method]", "GET")
 
     def rotate_token(match):
@@ -1090,6 +1104,40 @@ def build_payload(args, target, texto=None):
         return random.choice(choices) if choices else ""
     template = re.sub(r"\[rotate=([^\]]*)\]", rotate_token, template)
     return template.encode()
+
+
+_MARCADOR_SPLIT = re.compile(rb"\[instant_split\]|\[delay_split\]|\[split\]")
+
+
+def dividir_payload(payload):
+    """Quebra o payload nos marcadores de split, guardando o tipo de cada um:
+    [split] (padrão, espera um pouco a resposta), [instant_split] (manda a
+    2ª parte sem esperar nada) e [delay_split] (espera alguns segundos antes
+    da 2ª parte). Retorna [(parte, modo_antes_dela)], modo=None na 1ª parte."""
+    partes, pos, modo = [], 0, None
+    for m in _MARCADOR_SPLIT.finditer(payload):
+        partes.append((payload[pos:m.start()], modo))
+        modo = {b"[split]": "normal", b"[instant_split]": "instant",
+                b"[delay_split]": "delay"}[m.group()]
+        pos = m.end()
+    partes.append((payload[pos:], modo))
+    return [p for p in partes if p[0]]
+
+
+async def enviar_payload_partes(r, w, payload, args):
+    """Envia o payload parte a parte, respeitando o tipo de split de cada uma."""
+    for i, (parte, modo) in enumerate(dividir_payload(payload)):
+        if i > 0:
+            if modo == "delay":
+                await asyncio.sleep(getattr(args, "split_delay", 2.0))
+            elif modo == "normal":
+                try:
+                    await asyncio.wait_for(r.read(65536), min(args.timeout, 1.0))
+                except asyncio.TimeoutError:
+                    pass
+            # modo == "instant": manda na hora, sem esperar nada
+        w.write(parte)
+        await w.drain()
 
 
 def build_combos(args):
@@ -1157,6 +1205,7 @@ def pedir_payload(rotulo, args=None):
             a2.proxy = getattr(a2, "proxy", None)
             a2.timeout = getattr(a2, "timeout", 2.0) or 2.0
             a2.tls_version = getattr(a2, "tls_version", None)
+            a2.split_delay = getattr(a2, "split_delay", 2.0) or 2.0
             melhor = asyncio.run(gerar_payload(a2))
             if melhor:
                 esc2 = input(c("1;36", " ❯ ") + "Usar esse payload? (s/n) [s]: ").strip().lower()
@@ -1221,30 +1270,47 @@ def make_ssl_ctx(args):
 # ============== gerador de payload / testador de host-sni / perfis ==============
 # Em vez de montar o payload na mão, o script testa várias variações numa
 # rede/IP de verdade e mostra quais funcionaram (status esperado + latência).
-PAYLOAD_METODOS = ["GET", "HEAD"]
-PAYLOAD_CAMINHOS = ["/", "/ws"]
+PAYLOAD_METODOS = ["GET", "HEAD", "ACL"]
+PAYLOAD_CAMINHOS = ["/", "/ws", "/chat"]
 PAYLOAD_QUEBRAS = ["[crlf]", "[lf]"]
 PAYLOAD_CABECALHOS = [
     ("sem upgrade", ""),
-    ("upgrade/keep-alive", "Upgrade: websocket[Q]Connection: Keep-Alive[Q]"),
-    ("connection/upgrade", "Connection: Upgrade[Q]Upgrade: Websocket[Q]"),
+    ("upgrade+keep-alive", "Upgrade: websocket[Q]Connection: Keep-Alive[Q]"),
+    ("connection+upgrade", "Connection: Upgrade[Q]Upgrade: Websocket[Q]"),
+    ("só keep-alive", "Connection: Keep-Alive[Q]"),
+    ("handshake completo", "Upgrade: websocket[Q]Connection: Upgrade[Q]"
+                            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==[Q]Sec-WebSocket-Version: 13[Q]"),
+    ("content-length falso", "Content-Length: 9999999999999[Q]"),
 ]
+# Tipos de split testados além do payload sem split: padrão (espera um
+# pouco a resposta antes da 2ª parte), instantâneo (sem espera nenhuma) e
+# com atraso (espera alguns segundos — útil contra DPI que olha só o 1º pacote).
+PAYLOAD_SPLITS = [(" +split", "[split]"), (" +instant", "[instant_split]"),
+                  (" +delay", "[delay_split]")]
 
 
-def gerar_variantes_payload(ua=True):
-    """Monta os modelos de payload a testar (ainda com tokens [host]/[crlf]/[lf])."""
+def gerar_variantes_payload(ua=True, incluir_split=True):
+    """Monta todos os modelos de payload a testar (combina método, caminho,
+    quebra de linha, cabeçalho e, opcionalmente, as 3 formas de split:
+    1ª requisição no Host do SNI, 2ª no Host real — como no modo SSH/porta 80)."""
     variantes = []
     for metodo in PAYLOAD_METODOS:
         for caminho in PAYLOAD_CAMINHOS:
             for quebra in PAYLOAD_QUEBRAS:
                 for nome_cab, cab in PAYLOAD_CABECALHOS:
-                    corpo = (f"{metodo} {caminho} HTTP/1.1[Q]Host: [host][Q]" + cab)
-                    if ua:
-                        corpo += "User-Agent: [ua][Q]"
-                    corpo += "[Q]"
-                    corpo = corpo.replace("[Q]", quebra)
-                    rotulo = f"{metodo} {caminho} {quebra.strip('[]')} · {nome_cab}"
-                    variantes.append((rotulo, corpo))
+                    def montar(host_token):
+                        corpo = f"{metodo} {caminho} HTTP/1.1[Q]Host: {host_token}[Q]" + cab
+                        if ua:
+                            corpo += "User-Agent: [ua][Q]"
+                        corpo += "[Q]"
+                        return corpo.replace("[Q]", quebra)
+
+                    rotulo_base = f"{metodo} {caminho} {quebra.strip('[]')} · {nome_cab}"
+                    variantes.append((rotulo_base, montar("[host]")))
+                    if incluir_split:
+                        for sufixo, marcador in PAYLOAD_SPLITS:
+                            corpo_split = montar("[sni]") + marcador + montar("[host]")
+                            variantes.append((rotulo_base + sufixo, corpo_split))
     return variantes
 
 
@@ -1258,15 +1324,7 @@ async def testar_um_payload(ip, porta, template, args, ssl_ctx, ranges, use_tls,
                 open_conn(ip, args, ssl_ctx if use_tls else None, porta, use_tls),
                 args.timeout * 2 if use_tls else args.timeout)
             payload = build_payload(args, ip, template)
-            partes = [p for p in payload.split(b"[split]") if p]
-            for i, parte in enumerate(partes):
-                w.write(parte)
-                await w.drain()
-                if i < len(partes) - 1:
-                    try:
-                        await asyncio.wait_for(r.read(65536), min(args.timeout, 1.0))
-                    except asyncio.TimeoutError:
-                        pass
+            await enviar_payload_partes(r, w, payload, args)
             raw = await asyncio.wait_for(r.readline(), args.timeout)
             linha = raw.decode("latin-1", "replace").strip()
             ms = int((time.monotonic() - t0) * 1000)
@@ -1298,13 +1356,17 @@ async def gerar_payload(args):
         print(c("2", f" Host: {host_mostrar}   SNI: {sni_mostrar}"))
     else:
         print(c("2", f" Host/SNI: {host_mostrar}"))
-    print(c("2", f" Testando {len(variantes)} variações..."))
+    print(c("2", f" Testando {len(variantes)} variações (as '+delay' esperam "
+                 f"{getattr(args, 'split_delay', 2.0):g}s a mais cada uma)..."))
     print()
-    sem = asyncio.Semaphore(12)
+    sem = asyncio.Semaphore(16)
 
     async def um(rotulo, template):
         async with sem:
-            res = await testar_um_payload(ip, porta, template, args, ssl_ctx, ranges, use_tls)
+            # tries=1 aqui: com centenas de variações, 2 tentativas por uma
+            # dobraria o tempo total. O "+delay" já espera sozinho, então
+            # não precisa de retry para mostrar o efeito.
+            res = await testar_um_payload(ip, porta, template, args, ssl_ctx, ranges, use_tls, tries=1)
         if res:
             print(f" {c('1;32', '✔')} {c('1', rotulo.ljust(32))} {c('32', res[0][:30])}  {c('2', f'{res[1]}ms')}")
         return (rotulo, template, res)
@@ -1442,18 +1504,11 @@ async def probe_combo(target, args, ssl_ctx, ranges, modo, porta):
             COMBO_SEEN[f"{chave} não conectou"] += 1
             continue
         try:
-            # [split] divide o payload em requisições enviadas em sequência na
-            # mesma conexão (ex.: 1ª com Host da SNI, 2ª com o Host real).
-            # A resposta das partes anteriores é descartada; vale a da última.
-            partes = [p for p in payload.split(b"[split]") if p]
-            for i, parte in enumerate(partes):
-                w.write(parte)
-                await w.drain()
-                if i < len(partes) - 1:
-                    try:
-                        await asyncio.wait_for(r.read(65536), min(args.timeout, 1.0))
-                    except asyncio.TimeoutError:
-                        pass
+            # [split]/[instant_split]/[delay_split] dividem o payload em
+            # requisições enviadas em sequência na mesma conexão (ex.: 1ª com
+            # Host do SNI, 2ª com o Host real). A resposta das partes
+            # anteriores é descartada; vale a da última.
+            await enviar_payload_partes(r, w, payload, args)
             raw = await asyncio.wait_for(r.readline(), args.timeout)
             linha = raw.decode("latin-1", "replace").strip()
             ms = int((time.monotonic() - t0) * 1000)
@@ -1955,6 +2010,7 @@ def build_parser():
     g2.add_argument("--testar-hosts", metavar="ARQUIVO", help="testa uma lista de hosts/SNI (um por linha) com o --payload atual; use com --ip")
     g2.add_argument("--ip", help="IP alvo para --testar-hosts")
     g2.add_argument("--porta-gerar", type=int, default=443, help="porta usada por --gerar-payload / --testar-hosts")
+    g2.add_argument("--split-delay", type=float, default=2.0, help="segundos de espera no [delay_split] (padrão 2.0)")
     g2.add_argument("--salvar-perfil", metavar="NOME", help="salva modo/host/sni/payload atuais como um perfil de rede")
     g2.add_argument("--usar-perfil", metavar="NOME", help="carrega um perfil salvo (modo/host/sni/payload) antes de rodar")
     g2.add_argument("--listar-perfis", action="store_true", help="lista os perfis salvos e sai")
