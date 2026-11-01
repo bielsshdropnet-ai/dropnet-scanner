@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 """
-DROPNET SCANNER v2.6.1
+DROPNET SCANNER v2.7
 Varre faixas de CDNs/provedores e separa os IPs por porta (80 / 443).
+
+Novidades da v2.7:
+  - Novo estilo de cabeçalho: "Upgrade" sozinho, sem ": valor" (não é HTTP
+    válido, mas algumas CDNs — como a Azion neste caso — só checam se a
+    palavra aparece e já trocam para 101)
+  - O payload exato confirmado em uso real (HEAD /ws, sem User-Agent,
+    "Upgrade" sozinho) agora está garantido entre as variações testadas
+  - Gerador: de 432 para 522 variações
 
 Novidades da v2.6.1:
   - Corrigido bug grave: a opção 4 (Gerar) do assistente, quando aberta de
@@ -75,7 +83,7 @@ import sys
 import textwrap
 import time
 
-VERSION = "2.6.1"
+VERSION = "2.7"
 # Pasta fixa para salvar automaticamente os resultados no Android/Termux.
 # O caminho ~/storage/downloads é o atalho criado pelo termux-setup-storage.
 OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "storage", "downloads", "DROPNET-SCANNER")
@@ -1291,6 +1299,10 @@ PAYLOAD_CABECALHOS = [
     ("handshake completo", "Upgrade: websocket[Q]Connection: Upgrade[Q]"
                             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==[Q]Sec-WebSocket-Version: 13[Q]"),
     ("content-length falso", "Content-Length: 9999999999999[Q]"),
+    # "Upgrade" sozinho, sem ": valor" — tecnicamente não é um cabeçalho
+    # HTTP válido, mas algumas CDNs só checam se a palavra aparece em
+    # algum lugar do pedido e já trocam para 101 sem validar o resto.
+    ("upgrade sozinho (sem valor)", "Upgrade[Q]"),
 ]
 # Tipos de split testados além do payload sem split: padrão (espera um
 # pouco a resposta antes da 2ª parte), instantâneo (sem espera nenhuma) e
@@ -1321,6 +1333,16 @@ def gerar_variantes_payload(ua=True, incluir_split=True):
                         for sufixo, marcador in PAYLOAD_SPLITS:
                             corpo_split = montar("[sni]") + marcador + montar("[host]")
                             variantes.append((rotulo_base + sufixo, corpo_split))
+
+    # Variante enxuta confirmada em uso real: sem User-Agent, "Upgrade"
+    # sozinho — algumas CDNs já trocam pra 101 só de ver essa palavra.
+    for metodo in PAYLOAD_METODOS:
+        for caminho in PAYLOAD_CAMINHOS:
+            for quebra in PAYLOAD_QUEBRAS:
+                corpo = (f"{metodo} {caminho} HTTP/1.1[Q]Host: [host][Q]Upgrade[Q][Q]"
+                         .replace("[Q]", quebra))
+                variantes.append((f"{metodo} {caminho} {quebra.strip('[]')} · "
+                                   "upgrade sozinho, sem UA", corpo))
     return variantes
 
 
