@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """
-DROPNET SCANNER v2.1
+DROPNET SCANNER v2.2
 Varre faixas de CDNs/provedores e separa os IPs por porta (80 / 443).
+
+Novidades da v2.2:
+  - TLS correto na 443 na revisão dos IPs sem resposta
+  - faixas sobrepostas são unidas (sem IP repetido)
+  - hits salvos na hora em <prefixo>_parcial.txt (não perde se o Termux fechar)
+  - sockets fechados corretamente (wait_closed)
+  - semáforo não vaza ao cancelar (Ctrl+C)
+  - entradas numéricas validadas no modo avançado
+  - "todos os IPs" agora é realmente todos (0 = sem limite)
+  - embaralha por blocos /24 (menos chance de rate limit)
 
 Uso:
   python dropnet_scanner.py                 -> menu (CDN, tipo de busca, porta e payload)
@@ -29,10 +39,11 @@ import sys
 import textwrap
 import time
 
-VERSION = "2.1"
+VERSION = "2.2"
 # Pasta fixa para salvar automaticamente os resultados no Android/Termux.
 # O caminho ~/storage/downloads é o atalho criado pelo termux-setup-storage.
 OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "storage", "downloads", "DROPNET-SCANNER")
+
 
 def output_path(filename):
     """Cria a pasta automaticamente e devolve o caminho do arquivo de saída."""
@@ -54,10 +65,12 @@ def output_path(filename):
         "No Termux, execute termux-setup-storage uma única vez e permita o acesso."
     ) from ultimo_erro
 
+
 RETRY_TOTAL_LIMIT = 20000   # até esse tamanho, guarda quem NUNCA respondeu p/ tentar de novo
 
 FAIL = Counter()   # por que as conexões falharam (timeout / recusado / outro)
 SEEN = Counter()   # o que os IPs com porta aberta responderam ao teste real
+PARCIAL = {}       # arquivo de hits salvos na hora (nome -> caminho)
 
 APP_UA = "ScannerV4/1.0"
 
@@ -72,6 +85,31 @@ TLS_VERSIONS = {
     "1.2": ssl.TLSVersion.TLSv1_2,
     "1.3": ssl.TLSVersion.TLSv1_3,
 }
+
+
+# ============================ utilidades ============================
+async def fechar(w):
+    """Fecha o socket de verdade (close + wait_closed), sem travar."""
+    if w is None:
+        return
+    try:
+        w.close()
+        await asyncio.wait_for(w.wait_closed(), 2)
+    except Exception:
+        pass
+
+
+def salvar_parcial(args, linha):
+    """Grava cada hit na hora, para não perder nada se o app for fechado."""
+    nome = (args.output or "dropnet_scan") + "_parcial.txt"
+    try:
+        if nome not in PARCIAL:
+            PARCIAL[nome] = output_path(nome)
+            open(PARCIAL[nome], "w", encoding="utf-8").close()
+        with open(PARCIAL[nome], "a", encoding="utf-8") as f:
+            f.write(linha + "\n")
+    except OSError:
+        pass
 
 
 # ============================ visual ============================
@@ -204,7 +242,8 @@ def parse_nets(cidrs):
             continue
         if n.version == 4:
             nets.append(n)
-    return nets
+    # Une faixas sobrepostas/adjacentes: nenhum IP é testado duas vezes.
+    return list(ipaddress.collapse_addresses(nets))
 
 
 def total_ips(cidrs):
@@ -227,7 +266,16 @@ def iter_targets(cidrs, max_ips, shuffle):
             yield str(nets[k][off - starts[k]])
         return
     if shuffle:
-        random.shuffle(nets)
+        # Embaralha por blocos /24: espalha a carga e evita rate limit
+        # por varrer uma faixa inteira em sequência.
+        blocos = []
+        for net in nets:
+            if net.prefixlen < 24:
+                blocos.extend(net.subnets(new_prefix=24))
+            else:
+                blocos.append(net)
+        random.shuffle(blocos)
+        nets = blocos
     for net in nets:
         for ip in net:
             yield str(ip)
@@ -306,11 +354,7 @@ async def probe_tcp(target, args, ports):
                 print(f"[--] {target}:{porta} falhou ({type(e).__name__})", flush=True)
             return None
         finally:
-            if w is not None:
-                try:
-                    w.close()
-                except Exception:
-                    pass
+            await fechar(w)
 
     res = await asyncio.gather(*(uma(p) for p in ports))
     abertas = [p for p in res if p]
@@ -322,18 +366,7 @@ async def probe_tcp(target, args, ports):
 async def probe_http(target, args, ssl_ctx, ranges, port=None, use_tls=None, tries=1):
     port = port or args.port
     use_tls = args.tls if use_tls is None else use_tls
-    host_header = getattr(args, "host", None) or args.sni or target
-    # Tokens compatíveis com os tokens visíveis no APK.
-    # [crlf] usa CRLF; [lf] usa LF; [host], [ip], [ua] e [method] são substituídos.
-    template = args.payload.replace("[crlf]", "\r\n").replace("[lf]", "\n")
-    template = template.replace("[host]", host_header).replace("[ip]", target)
-    template = template.replace("[ua]", APP_UA).replace("[method]", "GET")
-    # [rotate=a;b] seleciona uma alternativa por requisição.
-    def rotate_token(match):
-        choices = [x for x in match.group(1).split(";") if x]
-        return random.choice(choices) if choices else ""
-    template = re.sub(r"\[rotate=([^\]]*)\]", rotate_token, template)
-    payload = template.encode()
+    payload = build_payload(args, target)
     t0 = time.monotonic()
     for tentativa in range(tries):
         w = None
@@ -364,11 +397,7 @@ async def probe_http(target, args, ssl_ctx, ranges, port=None, use_tls=None, tri
                 print(f"[--] {target}:{port}: falhou ({type(e).__name__}: {e})", flush=True)
             continue
         finally:
-            if w is not None:
-                try:
-                    w.close()
-                except Exception:
-                    pass
+            await fechar(w)
     return None
 
 
@@ -415,6 +444,7 @@ async def run(args):
     ranges = parse_status_spec(args.status)
     FAIL.clear()
     SEEN.clear()
+    PARCIAL.clear()
 
     nofile = raise_nofile()
     por_ip = len(ports) if args.tcp else 1
@@ -427,18 +457,7 @@ async def run(args):
     if args.tcp and args.confirmar and 443 in ports:
         precisa_tls = True
     if precisa_tls:
-        ssl_ctx = ssl.create_default_context()
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl.CERT_NONE
-        if args.tls_version:
-            v = TLS_VERSIONS[args.tls_version]
-            ssl_ctx.minimum_version = v
-            ssl_ctx.maximum_version = v
-            if v in (ssl.TLSVersion.TLSv1, ssl.TLSVersion.TLSv1_1):
-                try:
-                    ssl_ctx.set_ciphers("DEFAULT@SECLEVEL=0")
-                except ssl.SSLError:
-                    pass
+        ssl_ctx = make_ssl_ctx(args)
 
     targets, total = build_targets(args)
     sem = asyncio.Semaphore(threads)
@@ -464,6 +483,7 @@ async def run(args):
 
     def show_hit(res):
         ip, pts, info, ms = res
+        salvar_parcial(args, f"{ip};{','.join(map(str, pts))};{info};{ms}ms")
         if args.tcp:
             cells = "".join(port_cell(p, pts) for p in ports)
             extra = ""
@@ -482,33 +502,30 @@ async def run(args):
         nonlocal done, n_abertos
         if rastrear_tudo:
             nunca_respondeu.add(t)
-        try:
-            if args.tcp and not args.confirmar:
-                res = await probe_tcp(t, args, ports)
-                if res and rastrear_tudo:
+        res = None
+        if args.tcp and not args.confirmar:
+            res = await probe_tcp(t, args, ports)
+            if res and rastrear_tudo:
+                nunca_respondeu.discard(t)
+        elif args.tcp and args.confirmar:
+            abertas = await probe_tcp(t, args, ports)
+            if abertas:
+                n_abertos += 1
+                if rastrear_tudo:
                     nunca_respondeu.discard(t)
-            elif args.tcp and args.confirmar:
-                abertas = await probe_tcp(t, args, ports)
-                res = None
-                if abertas:
-                    n_abertos += 1
-                    if rastrear_tudo:
-                        nunca_respondeu.discard(t)
-                    for p in abertas[1]:
-                        # Porta 443 precisa de handshake TLS; porta 80 permanece HTTP.
-                        tls_port = (p == 443)
-                        ok = await probe_http(t, args, ssl_ctx if tls_port else None,
-                                               ranges, port=p, use_tls=tls_port,
-                                               tries=args.tentativas)
-                        if ok:
-                            res = (t, [p], ok[2], ok[3]) if res is None else (
-                                t, res[1] + [p], res[2] + " | " + ok[2], max(res[3], ok[3]))
-            else:
-                res = await probe_http(t, args, ssl_ctx, ranges, tries=args.tentativas)
-                if res and rastrear_tudo:
-                    nunca_respondeu.discard(t)
-        finally:
-            sem.release()
+                for p in abertas[1]:
+                    # Porta 443 precisa de handshake TLS; porta 80 permanece HTTP.
+                    tls_port = (p == 443)
+                    ok = await probe_http(t, args, ssl_ctx if tls_port else None,
+                                          ranges, port=p, use_tls=tls_port,
+                                          tries=args.tentativas)
+                    if ok:
+                        res = (t, [p], ok[2], ok[3]) if res is None else (
+                            t, res[1] + [p], res[2] + " | " + ok[2], max(res[3], ok[3]))
+        else:
+            res = await probe_http(t, args, ssl_ctx, ranges, tries=args.tentativas)
+            if res and rastrear_tudo:
+                nunca_respondeu.discard(t)
         done += 1
         if res:
             results.append(res)
@@ -532,6 +549,8 @@ async def run(args):
             tk = asyncio.create_task(worker(t))
             tasks.add(tk)
             tk.add_done_callback(tasks.discard)
+            # libera a vaga SEMPRE que a task termina (mesmo se for cancelada)
+            tk.add_done_callback(lambda _f: sem.release())
         while tasks:
             await asyncio.wait(set(tasks))
     except (KeyboardInterrupt, asyncio.CancelledError):
@@ -556,11 +575,13 @@ async def run(args):
                     abertas = await probe_tcp(ip, args, ports)
                     if not abertas:
                         return
-                    n_abertos_local = abertas
                     res2 = None
-                    for p in n_abertos_local[1]:
-                        ok = await probe_http(ip, args, None, ranges, port=p,
-                                               use_tls=False, tries=max(args.tentativas, 2))
+                    for p in abertas[1]:
+                        # 443 com TLS (corrigido na v2.2); 80 em HTTP puro.
+                        tls_port = (p == 443)
+                        ok = await probe_http(ip, args, ssl_ctx if tls_port else None,
+                                              ranges, port=p, use_tls=tls_port,
+                                              tries=max(args.tentativas, 2))
                         if ok:
                             res2 = (ip, [p], ok[2], ok[3]) if res2 is None else (
                                 ip, res2[1] + [p], res2[2] + " | " + ok[2], max(res2[3], ok[3]))
@@ -584,9 +605,9 @@ async def run(args):
             interrupted = True
 
     # 2ª checagem: nos IPs achados, tenta de novo a porta que não abriu
-    # (em rede móvel alguns pacotes se perdem e dão falso "fechado")
-    # Pulada quando já confirma com HTTP: seria reconfirmar milhares de IPs
-    # com uma requisição completa só pra preencher o "badge" da outra porta.
+    # (em rede móvel alguns pacotes se perdem e dão falso "fechado").
+    # Só roda no modo TCP simples; com --confirmar seria reconfirmar milhares
+    # de IPs com uma requisição completa só pra preencher a outra porta.
     if args.tcp and not args.confirmar and len(ports) > 1 and not interrupted:
         faltam = [(r, [p for p in ports if p not in r[1]]) for r in results if len(r[1]) < len(ports)]
         if faltam and len(faltam) <= 3000:
@@ -596,12 +617,6 @@ async def run(args):
             async def recheck(r, miss):
                 async with sem2:
                     for p in miss:
-                        if args.confirmar:
-                            ok = await probe_http(r[0], args, None, ranges, port=p,
-                                                   use_tls=False, tries=2)
-                            if ok:
-                                r[1].append(p)
-                            continue
                         for _ in range(2):
                             w = None
                             try:
@@ -612,11 +627,7 @@ async def run(args):
                             except Exception:
                                 pass
                             finally:
-                                if w is not None:
-                                    try:
-                                        w.close()
-                                    except Exception:
-                                        pass
+                                await fechar(w)
 
             try:
                 await asyncio.gather(*(recheck(r, m) for r, m in faltam))
@@ -642,9 +653,10 @@ def save_lists(args, ports, results):
         grupos = {f"{base}.txt": [r[0] for r in results]}
     for nome, ips in grupos.items():
         if ips:
-            with open(output_path(nome), "w", encoding="utf-8") as f:
+            caminho = output_path(nome)
+            with open(caminho, "w", encoding="utf-8") as f:
                 f.write("\n".join(ips) + "\n")
-            saved.append((output_path(nome), len(ips)))
+            saved.append((caminho, len(ips)))
     return saved
 
 
@@ -742,6 +754,8 @@ def parse_ports(args):
 
 
 def build_payload(args, target, texto=None):
+    """Monta o payload final (única implementação, usada por todos os modos).
+    Tokens: [crlf] [lf] [host] [ip] [ua] [method] [rotate=a;b]"""
     host_header = getattr(args, "host", None) or args.sni or target
     template = (texto or args.payload).replace("[crlf]", "\r\n").replace("[lf]", "\n")
     template = template.replace("[host]", host_header).replace("[ip]", target)
@@ -896,10 +910,7 @@ async def probe_combo(target, args, ssl_ctx, ranges, modo, porta):
         except Exception:
             COMBO_SEEN[f"{chave} conectou e não respondeu"] += 1
         finally:
-            try:
-                w.close()
-            except Exception:
-                pass
+            await fechar(w)
     return None
 
 
@@ -907,6 +918,7 @@ async def run_combo(args):
     ranges = parse_status_spec(args.status)
     combos = build_combos(args)
     COMBO_SEEN.clear()
+    PARCIAL.clear()
     ssl_ctx = make_ssl_ctx(args) if any(m == "ssl" for m, _ in combos) else None
     nofile = raise_nofile()
     threads = max(1, min(args.threads, (nofile - 64) // len(combos)))
@@ -929,6 +941,7 @@ async def run_combo(args):
             last_draw = now
 
     def show_hit(ip, modo, porta, info, ms):
+        salvar_parcial(args, f"{ip}:{porta};{modo};{info};{ms}ms")
         txt = (f" {c('1;32', '✔')} {c('1', ip.ljust(15))} "
                f"{c('1;36', f'{modo}:{porta}'.ljust(9))} {c('32', info[:24])}  {c('2', f'{ms}ms')}")
         if UI.color:
@@ -938,11 +951,8 @@ async def run_combo(args):
 
     async def worker(ip):
         nonlocal done
-        try:
-            res = await asyncio.gather(
-                *(probe_combo(ip, args, ssl_ctx, ranges, m, p) for m, p in combos))
-        finally:
-            sem.release()
+        res = await asyncio.gather(
+            *(probe_combo(ip, args, ssl_ctx, ranges, m, p) for m, p in combos))
         done += 1
         achou = False
         for (m, p), ok in zip(combos, res):
@@ -961,6 +971,8 @@ async def run_combo(args):
             tk = asyncio.create_task(worker(t))
             tasks.add(tk)
             tk.add_done_callback(tasks.discard)
+            # libera a vaga SEMPRE que a task termina (mesmo se for cancelada)
+            tk.add_done_callback(lambda _f: sem.release())
         while tasks:
             await asyncio.wait(set(tasks))
     except (KeyboardInterrupt, asyncio.CancelledError):
@@ -1007,17 +1019,18 @@ def summary_combo(args, combos, hits, done, dur, interrupted):
     saved = []
     if hits:
         nome = f"{base}_funcionando.txt"
-        with open(output_path(nome), "w", encoding="utf-8") as f:
+        caminho = output_path(nome)
+        with open(caminho, "w", encoding="utf-8") as f:
             for ip, m, p, info, ms in hits:
                 f.write(f"{ip}:{p};{m};{info};{ms}ms\n")
-        saved.append((output_path(nome), len(hits)))
+        saved.append((caminho, len(hits)))
         for m, p in combos:
             ips = [h[0] for h in hits if h[1] == m and h[2] == p]
             if ips and len(combos) > 1:
-                nome = f"{base}_{m}_{p}.txt"
-                with open(output_path(nome), "w", encoding="utf-8") as f:
+                caminho = output_path(f"{base}_{m}_{p}.txt")
+                with open(caminho, "w", encoding="utf-8") as f:
                     f.write("\n".join(ips) + "\n")
-                saved.append((output_path(nome), len(ips)))
+                saved.append((caminho, len(ips)))
     print()
     if saved:
         line("─", "2")
@@ -1096,6 +1109,15 @@ def ask_busca(args):
 def ask(texto, padrao):
     r = input(c("1;36", " ❯ ") + f"{texto.strip()} [{padrao}]: ").strip()
     return r if r else str(padrao)
+
+
+def ask_num(texto, padrao, tipo=int):
+    """Como ask(), mas só aceita número válido (não derruba o script)."""
+    while True:
+        try:
+            return tipo(ask(texto, padrao))
+        except ValueError:
+            print(c("31", " Digite um número válido."))
 
 
 def show_menu(provs):
@@ -1179,7 +1201,7 @@ def interactive(base):
                 print(c("33", " Nenhuma faixa corresponde. Usando todas."))
 
     total = total_ips(cidrs)
-    args.max_ips = 1000000   # sem amostra: testa TODOS os IPs, mesmo em CDNs grandes
+    args.max_ips = 0   # 0 = testa TODOS os IPs (sem amostra)
 
     args.modo = None
     ask_busca(args)
@@ -1193,17 +1215,17 @@ def interactive(base):
                 args.payload = pedir_payload(f"Payload {args.port}")
                 args.host = pedir_texto("Host (vai no payload)")
                 args.status = ask("Status de sucesso", args.status)
-                args.tentativas = int(ask("Tentativas por IP", args.tentativas))
-        args.max_ips = int(ask("Quantos IPs testar (0 = todos)", args.max_ips))
-        args.threads = int(ask("Threads", args.threads))
-        args.timeout = float(ask("Timeout (s)", args.timeout))
-        args.shuffle = args.max_ips > 0
+                args.tentativas = ask_num("Tentativas por IP", args.tentativas)
+        args.max_ips = ask_num("Quantos IPs testar (0 = todos)", args.max_ips)
+        args.threads = ask_num("Threads", args.threads)
+        args.timeout = ask_num("Timeout (s)", args.timeout, float)
 
-    sel = min(total, args.max_ips) if args.max_ips else total
+    amostra = bool(args.max_ips) and args.max_ips < total
+    sel = args.max_ips if amostra else total
     print()
     line("═", "1;36")
     info_row("CDN", c("1", ", ".join(nomes)))
-    info_row("Faixas", f"{len(cidrs)}  ·  {fmt(sel)} IPs" + (c("2", "  (amostra)") if args.max_ips else ""))
+    info_row("Faixas", f"{len(cidrs)}  ·  {fmt(sel)} IPs" + (c("2", "  (amostra)") if amostra else ""))
     if args.modo:
         info_row("Busca", c("1", "Proxy + Payload"))
         info_row("Portas", " + ".join(f"{p} ({m})" for m, p in build_combos(args)))
@@ -1224,11 +1246,7 @@ def interactive(base):
     return args
 
 
-
 # ============================ diagnóstico ============================
-APP_UA = "ScannerV4/1.0"
-
-
 def diag_variants(host):
     return [
         ("GET simples",
@@ -1265,11 +1283,7 @@ async def diag_one(ip, port, tls, nome, req, args):
     except Exception as e:
         return f"falhou ({type(e).__name__})"
     finally:
-        if w is not None:
-            try:
-                w.close()
-            except Exception:
-                pass
+        await fechar(w)
 
 
 async def diag(args):
@@ -1293,6 +1307,7 @@ async def diag(args):
 
 def build_parser():
     p = argparse.ArgumentParser(description="DROPNET SCANNER - scanner IPv4 por CDN/provedor")
+    p.add_argument("--version", action="version", version=f"DROPNET SCANNER v{VERSION}")
     g = p.add_argument_group("alvos")
     g.add_argument("--cidr", action="append", help="faixa CIDR (pode repetir)")
     g.add_argument("--cidr-file", help="arquivo com um CIDR por linha")
@@ -1300,7 +1315,7 @@ def build_parser():
     g.add_argument("--provider", action="append", help="nome do provedor (azion, cloudflare...)")
     g.add_argument("--hosts", help="arquivo com hosts/IPs (um por linha)")
     g.add_argument("--max-ips", type=int, default=0, help="limite de IPs (0 = todos)")
-    g.add_argument("--shuffle", action="store_true", help="embaralha as faixas")
+    g.add_argument("--shuffle", action="store_true", help="embaralha as faixas (por blocos /24)")
 
     c_ = p.add_argument_group("conexão")
     c_.add_argument("--port", type=int, default=80)
