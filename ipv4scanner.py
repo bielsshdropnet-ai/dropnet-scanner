@@ -30,6 +30,13 @@ import textwrap
 import time
 
 VERSION = "2.1"
+# Pasta fixa para salvar os resultados no armazenamento compartilhado do Android/Termux.
+OUTPUT_DIR = "/storage/emulated/0/Download/DROPNET-SCANNER"
+
+def output_path(filename):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    return os.path.join(OUTPUT_DIR, os.path.basename(filename))
+
 RETRY_TOTAL_LIMIT = 20000   # até esse tamanho, guarda quem NUNCA respondeu p/ tentar de novo
 
 FAIL = Counter()   # por que as conexões falharam (timeout / recusado / outro)
@@ -618,9 +625,9 @@ def save_lists(args, ports, results):
         grupos = {f"{base}.txt": [r[0] for r in results]}
     for nome, ips in grupos.items():
         if ips:
-            with open(nome, "w", encoding="utf-8") as f:
+            with open(output_path(nome), "w", encoding="utf-8") as f:
                 f.write("\n".join(ips) + "\n")
-            saved.append((nome, len(ips)))
+            saved.append((output_path(nome), len(ips)))
     return saved
 
 
@@ -983,17 +990,17 @@ def summary_combo(args, combos, hits, done, dur, interrupted):
     saved = []
     if hits:
         nome = f"{base}_funcionando.txt"
-        with open(nome, "w", encoding="utf-8") as f:
+        with open(output_path(nome), "w", encoding="utf-8") as f:
             for ip, m, p, info, ms in hits:
                 f.write(f"{ip}:{p};{m};{info};{ms}ms\n")
-        saved.append((nome, len(hits)))
+        saved.append((output_path(nome), len(hits)))
         for m, p in combos:
             ips = [h[0] for h in hits if h[1] == m and h[2] == p]
             if ips and len(combos) > 1:
                 nome = f"{base}_{m}_{p}.txt"
-                with open(nome, "w", encoding="utf-8") as f:
+                with open(output_path(nome), "w", encoding="utf-8") as f:
                     f.write("\n".join(ips) + "\n")
-                saved.append((nome, len(ips)))
+                saved.append((output_path(nome), len(ips)))
     print()
     if saved:
         line("─", "2")
