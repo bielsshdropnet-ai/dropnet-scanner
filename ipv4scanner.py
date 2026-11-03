@@ -4,7 +4,7 @@ DROPNET SCANNER v3.0
 Varre faixas de CDNs/provedores e separa os IPs por porta (80 / 443).
 
 Novidades da v3.0:
-  - Vários Host/SNI em rodízio: ao perguntar Host ou SNI no menu, agora dá
+  - Vários Host/SNI em rotate: ao perguntar Host ou SNI no menu, agora dá
     pra adicionar mais de um ("Adicionar outro?"). Com 2+ valores, um
     diferente é sorteado a cada requisição (Host e SNI de forma
     independente), em vez de bater sempre no mesmo domínio
@@ -2010,11 +2010,11 @@ def interactive(base):
         info_row("Busca", c("1", "Proxy + Payload"))
         info_row("Portas", " + ".join(f"{p} ({m})" for m, p in build_combos(args)))
         if getattr(args, "_hosts_pool", None):
-            info_row("Host", c("1", f"{len(args._hosts_pool)} em rodízio") + c("2", f"  ({args._hosts_pool[0]}, ...)"))
+            info_row("Host", c("1", f"{len(args._hosts_pool)} em rotate") + c("2", f"  ({args._hosts_pool[0]}, ...)"))
         elif args.host:
             info_row("Host", args.host)
         if args.modo in ("ssl", "ambos") and getattr(args, "_sni_pool", None):
-            info_row("SNI", c("1", f"{len(args._sni_pool)} em rodízio") + c("2", f"  ({args._sni_pool[0]}, ...)"))
+            info_row("SNI", c("1", f"{len(args._sni_pool)} em rotate") + c("2", f"  ({args._sni_pool[0]}, ...)"))
         elif args.modo in ("ssl", "ambos") and args.sni:
             info_row("SNI", args.sni)
         info_row("Status", args.status)
