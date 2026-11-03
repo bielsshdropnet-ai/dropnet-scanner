@@ -4,7 +4,7 @@ DROPNET SCANNER v3.0
 Varre faixas de CDNs/provedores e separa os IPs por porta (80 / 443).
 
 Novidades da v3.0:
-  - Vários Host/SNI em rotate: ao perguntar Host ou SNI no menu, agora dá
+  - Vários Host/SNI em rodízio: ao perguntar Host ou SNI no menu, agora dá
     pra adicionar mais de um ("Adicionar outro?"). Com 2+ valores, um
     diferente é sorteado a cada requisição (Host e SNI de forma
     independente), em vez de bater sempre no mesmo domínio
@@ -650,7 +650,7 @@ def pedir_host_sni(args, rotulo, campo):
         itens.append(pedir_texto(rotulo))
     if len(itens) > 1:
         setattr(args, pool_attr, itens)
-        print(c("32", f" {len(itens)}  {rotulo} - Random automático."))
+        print(c("32", f" {len(itens)} valores de {rotulo} em rodízio — um diferente é sorteado a cada requisição."))
     else:
         setattr(args, pool_attr, None)
     return itens[0]
@@ -1641,12 +1641,10 @@ async def run_combo(args):
                       for h in host_values for s in sni_values]
     # Evita pares repetidos sem alterar a ordem informada pelo usuário.
     host_sni_pairs = list(dict.fromkeys(host_sni_pairs))
-    # IMPORTANTE: cada IP agora dispara len(combos) * len(host_sni_pairs)
-    # conexões simultâneas (ex.: 2 portas x 9 pares Host/SNI = 18 por IP).
-    # O cálculo de threads precisa considerar isso, senão o número real de
-    # conexões abertas ao mesmo tempo estoura muito além de --threads e do
-    # limite de file descriptors (nofile), causando "too many open files"
-    # e deixando o scan instável/lento em vez de mais rápido.
+    # Cada IP dispara len(combos) * len(host_sni_pairs) conexões ao mesmo
+    # tempo (ex.: 2 portas x 9 pares Host/SNI = 18 por IP), então o número
+    # de IPs simultâneos precisa considerar isso para não estourar o limite
+    # de conexões abertas (nofile).
     conexoes_por_ip = max(1, len(combos) * len(host_sni_pairs))
     threads = max(1, min(args.threads, (nofile - 64) // conexoes_por_ip))
 
@@ -1654,8 +1652,8 @@ async def run_combo(args):
     cp = Checkpoint(args, "combo")
     PARCIAL_MANTER[0] = cp.retomou
     skip = cp.idx
-    hits = [tuple(h) for h in cp.hits]          # (ip, modo, porta, info, ms)
-    vistos = {(h[0], h[1], h[2]) for h in hits}
+    hits = [tuple(h) for h in cp.hits]          # (ip, modo, porta, host, sni, info, ms)
+    vistos = {(h[0], h[1], h[2], h[3], h[4]) for h in hits}
     done = skip
     interrupted = False
     last_draw = 0.0
@@ -1679,10 +1677,12 @@ async def run_combo(args):
             sys.stdout.flush()
             last_draw = now
 
-    def show_hit(ip, modo, porta, info, ms):
-        salvar_parcial(args, f"{ip}:{porta};{modo};{info};{ms}ms")
+    def show_hit(ip, modo, porta, host, sni, info, ms):
+        salvar_parcial(args, f"{ip}:{porta};{modo};{host};{sni};{info};{ms}ms")
+        hs = host if host == sni else f"{host} / SNI {sni}"
         txt = (f" {c('1;32', '✔')} {c('1', ip.ljust(15))} "
-               f"{c('1;36', f'{modo}:{porta}'.ljust(9))} {c('32', info[:24])}  {c('2', f'{ms}ms')}")
+               f"{c('1;36', f'{modo}:{porta}'.ljust(9))} {c('35', hs[:28].ljust(28))} "
+               f"{c('32', info[:20])}  {c('2', f'{ms}ms')}")
         if UI.color:
             sys.stdout.write("\r\033[K" + txt + "\n")
         else:
@@ -1690,9 +1690,11 @@ async def run_combo(args):
 
     async def worker(ip):
         nonlocal done
-        # Executa todos os pares HOST x SNI para cada modo/porta.
-        # Registra apenas o primeiro resultado positivo por IP/modo/porta,
-        # preservando o formato atual do checkpoint e dos arquivos de saída.
+        # Executa todos os pares HOST x SNI para cada modo/porta e registra
+        # TODOS os pares que funcionaram, separadamente — não só o primeiro.
+        # Assim dá pra ver, por exemplo, que na porta 80 funcionou Host A
+        # com SNI X e também Host B com SNI Y, cada um como um resultado
+        # próprio (porta + host + sni), em vez de agrupado num só "80 ok".
         pares_ip = [(h or s or ip, s or h or ip) for h, s in host_sni_pairs]
         res = await asyncio.gather(*(
             probe_combo(ip, args, ssl_ctx, ranges, m, p, pair)
@@ -1704,12 +1706,16 @@ async def run_combo(args):
         for m, p in combos:
             oks = res[idx:idx + len(pares_ip)]
             idx += len(pares_ip)
-            ok = next((item for item in oks if item), None)
-            if ok and (ip, m, p) not in vistos:
-                vistos.add((ip, m, p))
+            for (host_v, sni_v), ok in zip(pares_ip, oks):
+                if not ok:
+                    continue
+                chave = (ip, m, p, host_v, sni_v)
+                if chave in vistos:
+                    continue
+                vistos.add(chave)
                 achou = True
-                hits.append((ip, m, p, ok[0], ok[1]))
-                show_hit(ip, m, p, ok[0], ok[1])
+                hits.append((ip, m, p, host_v, sni_v, ok[0], ok[1]))
+                show_hit(ip, m, p, host_v, sni_v, ok[0], ok[1])
         redraw(achou)
         if not UI.color and done % 1000 == 0:
             print(f"... {done} testados, {len(hits)} ok", flush=True)
@@ -1745,7 +1751,7 @@ async def run_combo(args):
     if not interrupted:
         cp.concluir()
     summary_combo(args, combos, hits, done, time.monotonic() - start, interrupted,
-                  base_done=skip)
+                  base_done=skip, n_pares=len(host_sni_pairs))
     mostrar_rapido()
     if interrupted and cp.ativo:
         print(c("33", " Progresso salvo. Rode de novo com as mesmas opções para retomar."))
@@ -1761,7 +1767,21 @@ async def run_combo(args):
             pass
 
 
-def summary_combo(args, combos, hits, done, dur, interrupted, base_done=0):
+def sanitizar_nome_arquivo(s):
+    """Deixa um Host/SNI seguro para usar no nome de um arquivo."""
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", s).strip("_")[:40] or "x"
+
+
+def agrupar_por_host_sni(hits_subset):
+    """Agrupa uma lista de hits (mesma porta/modo) por par (host, sni),
+    devolvendo [((host, sni), [ips...]), ...] do maior pro menor."""
+    grupos = {}
+    for h in hits_subset:
+        grupos.setdefault((h[3], h[4]), []).append(h[0])
+    return sorted(grupos.items(), key=lambda kv: -len(kv[1]))
+
+
+def summary_combo(args, combos, hits, done, dur, interrupted, base_done=0, n_pares=1):
     print()
     line("═", "1;36")
     print(c("1;97", " RESULTADO (interrompido)" if interrupted else " RESULTADO"))
@@ -1772,15 +1792,26 @@ def summary_combo(args, combos, hits, done, dur, interrupted, base_done=0):
         pl = args.payload_ssh if m == "ssh" else args.payload
         print(f" {c('2', f'Payload {p}')}  {pl.replace(chr(10), ' ')[:60]}")
     print()
+
+    # Cada porta/modo é mostrado separado; dentro dele, cada Host/SNI que
+    # funcionou também aparece como uma linha própria (não some num total só).
+    mostrar_hs = n_pares > 1
     print(c("1", " Quem funcionou, por configuração:"))
     for m, p in combos:
-        n = len([h for h in hits if h[1] == m and h[2] == p])
+        subset = [h for h in hits if h[1] == m and h[2] == p]
+        n = len(subset)
         cor = "1;32" if n else "2"
         print(f"   {c('1;36', f'{m}:{p}'.ljust(10))} {c(cor, str(n))}")
+        if mostrar_hs and subset:
+            for (host_v, sni_v), ips in agrupar_por_host_sni(subset):
+                rotulo = host_v if host_v == sni_v else f"{host_v}  ·  SNI {sni_v}"
+                print(f"      {c('2', '↳')} {c('35', rotulo.ljust(32)[:32])} {c('1;32', str(len(ips)))}")
+
     ips_ok = sorted({h[0] for h in hits})
     print(f"\n {c('1', 'IPs que funcionaram')}  {c('1;32', str(len(ips_ok)))}")
     for h in hits[:20]:
-        print(f"   {h[0].ljust(15)} {f'{h[1]}:{h[2]}'.ljust(9)} {h[3][:24]}")
+        hs = h[3] if h[3] == h[4] else f"{h[3]}/{h[4]}"
+        print(f"   {h[0].ljust(15)} {f'{h[1]}:{h[2]}'.ljust(9)} {hs[:22].ljust(22)} {h[5][:20]}")
     if len(hits) > 20:
         print(c("2", f"   ... +{len(hits) - 20} no arquivo"))
 
@@ -1796,16 +1827,29 @@ def summary_combo(args, combos, hits, done, dur, interrupted, base_done=0):
         nome = f"{base}_funcionando.txt"
         caminho = output_path(nome)
         with open(caminho, "w", encoding="utf-8") as f:
-            for ip, m, p, info, ms in hits:
-                f.write(f"{ip}:{p};{m};{info};{ms}ms\n")
+            for ip, m, p, host_v, sni_v, info, ms in hits:
+                f.write(f"{ip}:{p};{m};{host_v};{sni_v};{info};{ms}ms\n")
         saved.append((caminho, len(hits)))
         for m, p in combos:
-            ips = [h[0] for h in hits if h[1] == m and h[2] == p]
+            subset = [h for h in hits if h[1] == m and h[2] == p]
+            ips = [h[0] for h in subset]
             if ips and len(combos) > 1:
                 caminho = output_path(f"{base}_{m}_{p}.txt")
                 with open(caminho, "w", encoding="utf-8") as f:
                     f.write("\n".join(ips) + "\n")
                 saved.append((caminho, len(ips)))
+            # Um arquivo por combinação Host/SNI dentro dessa porta, só
+            # quando há mais de um par configurado (senão seria redundante
+            # com o arquivo da porta acima).
+            if mostrar_hs:
+                for (host_v, sni_v), ips_hs in agrupar_por_host_sni(subset):
+                    nome_hs = sanitizar_nome_arquivo(host_v)
+                    if sni_v != host_v:
+                        nome_hs += "__sni_" + sanitizar_nome_arquivo(sni_v)
+                    caminho = output_path(f"{base}_{m}_{p}_{nome_hs}.txt")
+                    with open(caminho, "w", encoding="utf-8") as f:
+                        f.write("\n".join(ips_hs) + "\n")
+                    saved.append((caminho, len(ips_hs)))
     print()
     if saved:
         line("─", "2")
@@ -2010,11 +2054,11 @@ def interactive(base):
         info_row("Busca", c("1", "Proxy + Payload"))
         info_row("Portas", " + ".join(f"{p} ({m})" for m, p in build_combos(args)))
         if getattr(args, "_hosts_pool", None):
-            info_row("Host", c("1", f"{len(args._hosts_pool)} em rotate") + c("2", f"  ({args._hosts_pool[0]}, ...)"))
+            info_row("Host", c("1", f"{len(args._hosts_pool)} em rodízio") + c("2", f"  ({args._hosts_pool[0]}, ...)"))
         elif args.host:
             info_row("Host", args.host)
         if args.modo in ("ssl", "ambos") and getattr(args, "_sni_pool", None):
-            info_row("SNI", c("1", f"{len(args._sni_pool)} em rotate") + c("2", f"  ({args._sni_pool[0]}, ...)"))
+            info_row("SNI", c("1", f"{len(args._sni_pool)} em rodízio") + c("2", f"  ({args._sni_pool[0]}, ...)"))
         elif args.modo in ("ssl", "ambos") and args.sni:
             info_row("SNI", args.sni)
         info_row("Status", args.status)
