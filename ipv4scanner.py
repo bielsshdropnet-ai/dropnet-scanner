@@ -1,15 +1,7 @@
 #!/usr/bin/env python3
 """
-DROPNET SCANNER v3.0
+DROPNET SCANNER v2.7
 Varre faixas de CDNs/provedores e separa os IPs por porta (80 / 443).
-
-Novidades da v3.0:
-  - Vários Host/SNI em rodízio: ao perguntar Host ou SNI no menu, agora dá
-    pra adicionar mais de um ("Adicionar outro?"). Com 2+ valores, um
-    diferente é sorteado a cada requisição (Host e SNI de forma
-    independente), em vez de bater sempre no mesmo domínio
-  - Novo --hosts-lista / --sni-lista: carrega vários Hosts/SNIs de um
-    arquivo (um por linha) pra usar fora do menu interativo
 
 Novidades da v2.7:
   - Novo estilo de cabeçalho: "Upgrade" sozinho, sem ": valor" (não é HTTP
@@ -91,7 +83,7 @@ import sys
 import textwrap
 import time
 
-VERSION = "3.0"
+VERSION = "2.7"
 # Pasta fixa para salvar automaticamente os resultados no Android/Termux.
 # O caminho ~/storage/downloads é o atalho criado pelo termux-setup-storage.
 OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "storage", "downloads", "DROPNET-SCANNER")
@@ -604,58 +596,6 @@ def iter_hosts(path):
                 yield ln
 
 
-# ---------------------- vários Hosts/SNIs (rodízio) ----------------------
-def carregar_pools(args):
-    """Carrega --hosts-lista / --sni-lista (um valor por linha) em
-    args._hosts_pool / args._sni_pool. Com um pool carregado, cada
-    requisição sorteia um valor diferente em vez de usar sempre o mesmo
-    Host/SNI fixo — útil pra não depender de um único domínio na varredura."""
-    if getattr(args, "hosts_lista", None):
-        pool = [h for h in iter_hosts(args.hosts_lista)]
-        if not pool:
-            sys.exit(f"{args.hosts_lista} está vazio.")
-        args._hosts_pool = pool
-    if getattr(args, "sni_lista", None):
-        pool = [h for h in iter_hosts(args.sni_lista)]
-        if not pool:
-            sys.exit(f"{args.sni_lista} está vazio.")
-        args._sni_pool = pool
-
-
-def escolher_host_sni(args, target):
-    """Devolve (host, sni) pra uma requisição: sorteia do pool, se houver;
-    senão usa o valor fixo de sempre (args.host/args.sni), com o mesmo
-    fallback de antes (host -> sni -> target)."""
-    pool_h = getattr(args, "_hosts_pool", None)
-    pool_s = getattr(args, "_sni_pool", None)
-    host = random.choice(pool_h) if pool_h else (
-        getattr(args, "host", None) or getattr(args, "sni", None) or target)
-    sni = random.choice(pool_s) if pool_s else (getattr(args, "sni", None) or host)
-    return host, sni
-
-
-def pedir_host_sni(args, rotulo, campo):
-    """Como pedir_texto, mas deixa adicionar mais de um valor: pergunta
-    'adicionar outro?' depois de cada um. Com só 1 valor, funciona igual
-    a antes (fixo). Com 2+, um diferente é sorteado a cada requisição."""
-    pool_attr = "_hosts_pool" if campo == "host" else "_sni_pool"
-    itens = [pedir_texto(rotulo)]
-    while True:
-        try:
-            r = input(c("1;36", " ❯ ") + f"Adicionar outro {rotulo}? (s/n) [n]: ").strip().lower()
-        except EOFError:
-            break
-        if not r.startswith("s"):
-            break
-        itens.append(pedir_texto(rotulo))
-    if len(itens) > 1:
-        setattr(args, pool_attr, itens)
-        print(c("32", f" {len(itens)} valores de {rotulo} em rodízio — um diferente é sorteado a cada requisição."))
-    else:
-        setattr(args, pool_attr, None)
-    return itens[0]
-
-
 # ============================ testes ============================
 def parse_status_spec(spec):
     out = []
@@ -675,14 +615,10 @@ def status_ok(code, ranges):
     return any(a <= code <= b for a, b in ranges)
 
 
-async def open_conn(target, args, ssl_ctx, port=None, use_tls=None, host_sni=None):
+async def open_conn(target, args, ssl_ctx, port=None, use_tls=None):
     port = port or args.port
     use_tls = args.tls if use_tls is None else use_tls
-    sni = None
-    if use_tls:
-        # Usa exatamente o SNI da combinação atual; mantém o comportamento
-        # antigo para chamadas que não informam uma combinação explícita.
-        _, sni = host_sni if host_sni is not None else escolher_host_sni(args, target)
+    sni = args.sni if (use_tls and args.sni) else None
     if args.proxy:
         phost, _, pport = args.proxy.partition(":")
         r, w = await asyncio.open_connection(phost, int(pport or 8080))
@@ -1168,10 +1104,11 @@ def parse_ports(args):
     return out or [args.port]
 
 
-def build_payload(args, target, texto=None, host_sni=None):
+def build_payload(args, target, texto=None):
     """Monta o payload final (única implementação, usada por todos os modos).
     Tokens: [crlf] [lf] [host] [sni] [ip] [ua] [method] [split] [rotate=a;b]"""
-    host_header, sni_val = host_sni if host_sni is not None else escolher_host_sni(args, target)
+    host_header = getattr(args, "host", None) or getattr(args, "sni", None) or target
+    sni_val = getattr(args, "sni", None) or host_header
     template = (texto or args.payload).replace("[crlf]", "\r\n").replace("[lf]", "\n")
     template = template.replace("[host]", host_header).replace("[sni]", sni_val).replace("[ip]", target)
     template = template.replace("[ua]", APP_UA).replace("[method]", "GET")
@@ -1327,9 +1264,9 @@ def aplicar_padroes_combo(args):
     if args.modo in ("ssh", "ambos") and not getattr(args, "payload_ssh", None):
         args.payload_ssh = pedir_payload("Payload 80", args)
     if USOU_PRESET[0] and not getattr(args, "host", None):
-        args.host = pedir_host_sni(args, "Host (vai no payload)", "host")
+        args.host = pedir_texto("Host (vai no payload)")
     if args.modo in ("ssl", "ambos") and not args.sni:
-        args.sni = pedir_host_sni(args, "SNI (handshake TLS)", "sni")
+        args.sni = pedir_texto("SNI (handshake TLS)")
 
 
 def make_ssl_ctx(args):
@@ -1583,19 +1520,18 @@ def listar_perfis():
         print(f"   {c('36', nome.ljust(16))} modo {p['modo']}  host/sni: {p.get('host') or p.get('sni') or '-'}")
 
 
-async def probe_combo(target, args, ssl_ctx, ranges, modo, porta, host_sni=None):
-    """Testa uma combinação de modo/porta usando o par HOST/SNI informado."""
+async def probe_combo(target, args, ssl_ctx, ranges, modo, porta):
+    """Testa UMA combinação (modo + porta + payload) num IP.
+    Retorna (info, ms) se funcionou, senão None."""
     use_tls = modo == "ssl"
-    payload = build_payload(args, target, args.payload_ssh if modo == "ssh" else args.payload,
-                            host_sni=host_sni)
+    payload = build_payload(args, target, args.payload_ssh if modo == "ssh" else args.payload)
     chave = f"{modo}:{porta}"
     for _ in range(max(1, args.tentativas)):
         w = None
         t0 = time.monotonic()
         try:
             r, w = await asyncio.wait_for(
-                open_conn(target, args, ssl_ctx if use_tls else None, porta, use_tls,
-                          host_sni=host_sni),
+                open_conn(target, args, ssl_ctx if use_tls else None, porta, use_tls),
                 args.timeout * 2 if use_tls else args.timeout)
         except Exception:
             COMBO_SEEN[f"{chave} não conectou"] += 1
@@ -1630,18 +1566,7 @@ async def run_combo(args):
     RAPIDO.clear()
     ssl_ctx = make_ssl_ctx(args) if any(m == "ssl" for m, _ in combos) else None
     nofile = raise_nofile()
-    # Matriz completa: cada HOST é combinado com cada SNI.
-    hosts_pool = getattr(args, "_hosts_pool", None)
-    snis_pool = getattr(args, "_sni_pool", None)
-    host_values = hosts_pool or [getattr(args, "host", None) or getattr(args, "sni", None)]
-    sni_values = snis_pool or [getattr(args, "sni", None)]
-    host_values = [v for v in host_values if v] or [None]
-    sni_values = [v for v in sni_values if v] or [None]
-    host_sni_pairs = [(h or s or None, s or h or None)
-                      for h in host_values for s in sni_values]
-    # Evita pares repetidos sem alterar a ordem informada pelo usuário.
-    host_sni_pairs = list(dict.fromkeys(host_sni_pairs))
-    threads = max(1, min(args.threads, (nofile - 64) // max(1, len(combos))))
+    threads = max(1, min(args.threads, (nofile - 64) // len(combos)))
 
     aviso_rapido(args)
     cp = Checkpoint(args, "combo")
@@ -1683,21 +1608,11 @@ async def run_combo(args):
 
     async def worker(ip):
         nonlocal done
-        # Executa todos os pares HOST x SNI para cada modo/porta.
-        # Registra apenas o primeiro resultado positivo por IP/modo/porta,
-        # preservando o formato atual do checkpoint e dos arquivos de saída.
-        pares_ip = [(h or s or ip, s or h or ip) for h, s in host_sni_pairs]
-        res = await asyncio.gather(*(
-            probe_combo(ip, args, ssl_ctx, ranges, m, p, pair)
-            for m, p in combos for pair in pares_ip
-        ))
+        res = await asyncio.gather(
+            *(probe_combo(ip, args, ssl_ctx, ranges, m, p) for m, p in combos))
         done += 1
         achou = False
-        idx = 0
-        for m, p in combos:
-            oks = res[idx:idx + len(pares_ip)]
-            idx += len(pares_ip)
-            ok = next((item for item in oks if item), None)
+        for (m, p), ok in zip(combos, res):
             if ok and (ip, m, p) not in vistos:
                 vistos.add((ip, m, p))
                 achou = True
@@ -1862,9 +1777,9 @@ def ask_busca(args):
         print(c("2", " SNI  = nome do handshake TLS (só na 443)"))
     if precisa_host or tem_tls:
         print()
-    args.host = pedir_host_sni(args, "Host", "host") if precisa_host else None
+    args.host = pedir_texto("Host") if precisa_host else None
     if tem_tls:
-        args.sni = pedir_host_sni(args, "SNI", "sni")
+        args.sni = pedir_texto("SNI")
     args.status = ask("Status de sucesso", "101")
     args.tcp = False
     args.confirmar = False
@@ -1982,7 +1897,7 @@ def interactive(base):
                 print(c("33", " A confirmação só bate se o Host/SNI forem os certos"))
                 print(c("33", " dessa CDN/operadora (o mesmo valor que funciona na sua VPN)."))
                 args.payload = pedir_payload(f"Payload {args.port}", args)
-                args.host = pedir_host_sni(args, "Host (vai no payload)", "host")
+                args.host = pedir_texto("Host (vai no payload)")
                 args.status = ask("Status de sucesso", args.status)
                 args.tentativas = ask_num("Tentativas por IP", args.tentativas)
         args.max_ips = ask_num("Quantos IPs testar (0 = todos)", args.max_ips)
@@ -2002,13 +1917,9 @@ def interactive(base):
     if args.modo:
         info_row("Busca", c("1", "Proxy + Payload"))
         info_row("Portas", " + ".join(f"{p} ({m})" for m, p in build_combos(args)))
-        if getattr(args, "_hosts_pool", None):
-            info_row("Host", c("1", f"{len(args._hosts_pool)} em rodízio") + c("2", f"  ({args._hosts_pool[0]}, ...)"))
-        elif args.host:
+        if args.host:
             info_row("Host", args.host)
-        if args.modo in ("ssl", "ambos") and getattr(args, "_sni_pool", None):
-            info_row("SNI", c("1", f"{len(args._sni_pool)} em rodízio") + c("2", f"  ({args._sni_pool[0]}, ...)"))
-        elif args.modo in ("ssl", "ambos") and args.sni:
+        if args.modo in ("ssl", "ambos") and args.sni:
             info_row("SNI", args.sni)
         info_row("Status", args.status)
     else:
@@ -2106,8 +2017,6 @@ def build_parser():
     c_.add_argument("--tls", action="store_true", help="usar TLS/SNI (modo payload)")
     c_.add_argument("--sni", help="SNI / valor do [host] no payload")
     c_.add_argument("--host", help="valor do [host] no payload (modo combo; separado da SNI)")
-    c_.add_argument("--hosts-lista", help="arquivo com vários Hosts (um por linha); sorteia um diferente a cada requisição em vez de usar sempre o mesmo")
-    c_.add_argument("--sni-lista", help="arquivo com várias SNIs (um por linha); sorteia uma diferente a cada requisição em vez de usar sempre a mesma")
     c_.add_argument("--tls-version", choices=TLS_VERSIONS)
     c_.add_argument("--proxy", help="proxy HTTP CONNECT host:porta")
     c_.add_argument("--payload", default=DEFAULT_PAYLOAD, help="use [crlf], [lf], [host], [ip], [ua], [method], [rotate=a;b]")
@@ -2145,7 +2054,6 @@ def main():
     args = build_parser().parse_args()
     if args.no_color:
         UI.color = False
-    carregar_pools(args)
 
     if args.diag:
         try:
