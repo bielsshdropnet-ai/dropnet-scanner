@@ -675,12 +675,14 @@ def status_ok(code, ranges):
     return any(a <= code <= b for a, b in ranges)
 
 
-async def open_conn(target, args, ssl_ctx, port=None, use_tls=None):
+async def open_conn(target, args, ssl_ctx, port=None, use_tls=None, host_sni=None):
     port = port or args.port
     use_tls = args.tls if use_tls is None else use_tls
     sni = None
     if use_tls:
-        _, sni = escolher_host_sni(args, target)
+        # Usa exatamente o SNI da combinação atual; mantém o comportamento
+        # antigo para chamadas que não informam uma combinação explícita.
+        _, sni = host_sni if host_sni is not None else escolher_host_sni(args, target)
     if args.proxy:
         phost, _, pport = args.proxy.partition(":")
         r, w = await asyncio.open_connection(phost, int(pport or 8080))
@@ -1166,10 +1168,10 @@ def parse_ports(args):
     return out or [args.port]
 
 
-def build_payload(args, target, texto=None):
+def build_payload(args, target, texto=None, host_sni=None):
     """Monta o payload final (única implementação, usada por todos os modos).
     Tokens: [crlf] [lf] [host] [sni] [ip] [ua] [method] [split] [rotate=a;b]"""
-    host_header, sni_val = escolher_host_sni(args, target)
+    host_header, sni_val = host_sni if host_sni is not None else escolher_host_sni(args, target)
     template = (texto or args.payload).replace("[crlf]", "\r\n").replace("[lf]", "\n")
     template = template.replace("[host]", host_header).replace("[sni]", sni_val).replace("[ip]", target)
     template = template.replace("[ua]", APP_UA).replace("[method]", "GET")
@@ -1581,18 +1583,19 @@ def listar_perfis():
         print(f"   {c('36', nome.ljust(16))} modo {p['modo']}  host/sni: {p.get('host') or p.get('sni') or '-'}")
 
 
-async def probe_combo(target, args, ssl_ctx, ranges, modo, porta):
-    """Testa UMA combinação (modo + porta + payload) num IP.
-    Retorna (info, ms) se funcionou, senão None."""
+async def probe_combo(target, args, ssl_ctx, ranges, modo, porta, host_sni=None):
+    """Testa uma combinação de modo/porta usando o par HOST/SNI informado."""
     use_tls = modo == "ssl"
-    payload = build_payload(args, target, args.payload_ssh if modo == "ssh" else args.payload)
+    payload = build_payload(args, target, args.payload_ssh if modo == "ssh" else args.payload,
+                            host_sni=host_sni)
     chave = f"{modo}:{porta}"
     for _ in range(max(1, args.tentativas)):
         w = None
         t0 = time.monotonic()
         try:
             r, w = await asyncio.wait_for(
-                open_conn(target, args, ssl_ctx if use_tls else None, porta, use_tls),
+                open_conn(target, args, ssl_ctx if use_tls else None, porta, use_tls,
+                          host_sni=host_sni),
                 args.timeout * 2 if use_tls else args.timeout)
         except Exception:
             COMBO_SEEN[f"{chave} não conectou"] += 1
@@ -1627,7 +1630,18 @@ async def run_combo(args):
     RAPIDO.clear()
     ssl_ctx = make_ssl_ctx(args) if any(m == "ssl" for m, _ in combos) else None
     nofile = raise_nofile()
-    threads = max(1, min(args.threads, (nofile - 64) // len(combos)))
+    # Matriz completa: cada HOST é combinado com cada SNI.
+    hosts_pool = getattr(args, "_hosts_pool", None)
+    snis_pool = getattr(args, "_sni_pool", None)
+    host_values = hosts_pool or [getattr(args, "host", None) or getattr(args, "sni", None)]
+    sni_values = snis_pool or [getattr(args, "sni", None)]
+    host_values = [v for v in host_values if v] or [None]
+    sni_values = [v for v in sni_values if v] or [None]
+    host_sni_pairs = [(h or s or None, s or h or None)
+                      for h in host_values for s in sni_values]
+    # Evita pares repetidos sem alterar a ordem informada pelo usuário.
+    host_sni_pairs = list(dict.fromkeys(host_sni_pairs))
+    threads = max(1, min(args.threads, (nofile - 64) // max(1, len(combos))))
 
     aviso_rapido(args)
     cp = Checkpoint(args, "combo")
@@ -1669,11 +1683,21 @@ async def run_combo(args):
 
     async def worker(ip):
         nonlocal done
-        res = await asyncio.gather(
-            *(probe_combo(ip, args, ssl_ctx, ranges, m, p) for m, p in combos))
+        # Executa todos os pares HOST x SNI para cada modo/porta.
+        # Registra apenas o primeiro resultado positivo por IP/modo/porta,
+        # preservando o formato atual do checkpoint e dos arquivos de saída.
+        pares_ip = [(h or s or ip, s or h or ip) for h, s in host_sni_pairs]
+        res = await asyncio.gather(*(
+            probe_combo(ip, args, ssl_ctx, ranges, m, p, pair)
+            for m, p in combos for pair in pares_ip
+        ))
         done += 1
         achou = False
-        for (m, p), ok in zip(combos, res):
+        idx = 0
+        for m, p in combos:
+            oks = res[idx:idx + len(pares_ip)]
+            idx += len(pares_ip)
+            ok = next((item for item in oks if item), None)
             if ok and (ip, m, p) not in vistos:
                 vistos.add((ip, m, p))
                 achou = True
