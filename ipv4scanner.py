@@ -650,7 +650,7 @@ def pedir_host_sni(args, rotulo, campo):
         itens.append(pedir_texto(rotulo))
     if len(itens) > 1:
         setattr(args, pool_attr, itens)
-        print(c("32", f" {len(itens)} valores de {rotulo} em rodízio — um diferente é sorteado a cada requisição."))
+        print(c("32", f" {len(itens)}  {rotulo} - Random automático."))
     else:
         setattr(args, pool_attr, None)
     return itens[0]
