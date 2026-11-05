@@ -1,13 +1,7 @@
 #!/usr/bin/env python3
 """
-DROPNET SCANNER v3.1
+DROPNET SCANNER v3.0
 Varre faixas de CDNs/provedores e separa os IPs por porta (80 / 443).
-
-Novidades da v3.1:
-  - Menu inicial com cabeçalho e opções renumeradas/mais claras
-  - Nova busca de subdomínio: digite um domínio e o script lista os
-    subdomínios conhecidos (via crt.sh) já com o IP de cada um
-    (menu: opção "s", ou --subdominio dominio.com fora do menu)
 
 Novidades da v3.0:
   - Vários Host/SNI em rotate: ao perguntar Host ou SNI no menu, agora dá
@@ -92,15 +86,12 @@ import os
 import random
 import re
 import shutil
-import socket
 import ssl
 import sys
 import textwrap
 import time
-import urllib.error
-import urllib.request
 
-VERSION = "3.1"
+VERSION = "3.0"
 # Pasta fixa para salvar automaticamente os resultados no Android/Termux.
 # O caminho ~/storage/downloads é o atalho criado pelo termux-setup-storage.
 OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "storage", "downloads", "DROPNET-SCANNER")
@@ -448,10 +439,6 @@ def banner():
     print(c("1;36", "║") + c("1;97", "D R O P N E T".center(w)) + c("1;36", "║"))
     print(c("1;36", "║") + c("36", f"S C A N N E R   v{VERSION}".center(w)) + c("1;36", "║"))
     print(c("1;36", "╚" + "═" * w + "╝"))
-
-
-def subtitulo(txt):
-    print(c("2", txt.center(min(term_width() - 1, 38))))
 
 
 def line(ch="─", color="2"):
@@ -1785,151 +1772,6 @@ def sanitizar_nome_arquivo(s):
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", s).strip("_")[:40] or "x"
 
 
-# ============================ subdomínios ============================
-# Busca subdomínios conhecidos de um domínio (via certificados públicos,
-# crt.sh) e resolve o IP de cada um. Só biblioteca padrão.
-def resolver_ip(host):
-    """Resolve um host para IPv4. Devolve None se não existir/não responder."""
-    try:
-        return socket.gethostbyname(host)
-    except OSError:
-        return None
-
-
-def normalizar_dominio(texto):
-    """Aceita 'https://exemplo.com/path', 'www.exemplo.com' etc. e devolve
-    só o domínio limpo, em minúsculas."""
-    texto = texto.strip().lower()
-    texto = re.sub(r"^[a-z]+://", "", texto)
-    texto = texto.split("/", 1)[0]
-    texto = texto.split(":", 1)[0]
-    return texto.lstrip(".")
-
-
-# Subdomínios comuns testados sempre por DNS direto (não depende de
-# nenhum serviço externo, só do socket.gethostbyname já usado no resto
-# do script). Serve de base mínima e também de rede de segurança quando
-# o crt.sh está lento/fora do ar.
-WORDLIST_SUBDOMINIOS = [
-    "www", "mail", "webmail", "ftp", "ns1", "ns2", "smtp", "pop", "imap",
-    "vpn", "api", "dev", "test", "homolog", "staging", "admin", "cpanel",
-    "portal", "app", "apps", "mobile", "m", "secure", "remote", "loja",
-    "shop", "status", "static", "img", "cdn", "cdn1", "cdn2", "gateway",
-    "suporte", "support", "help", "ajuda", "painel", "dashboard", "auth",
-    "login", "sso", "beta", "demo", "images", "assets", "files",
-    "download", "upload", "video", "media", "db", "git", "monitor",
-    "proxy", "edge", "lb", "ws", "stream", "intranet", "extranet",
-    "blog", "docs", "wiki",
-]
-
-
-def wordlist_subdominios(dominio):
-    return {f"{w}.{dominio}" for w in WORDLIST_SUBDOMINIOS}
-
-
-def crtsh_subdominios(dominio, timeout=20, tentativas=2):
-    """Consulta o crt.sh (certificados TLS públicos já emitidos) e devolve
-    o conjunto de subdomínios encontrados para esse domínio. O crt.sh é
-    conhecido por ser lento/instável, então tenta mais de uma vez."""
-    url = f"https://crt.sh/?q=%25.{dominio}&output=json"
-    req = urllib.request.Request(url, headers={"User-Agent": APP_UA})
-    bruto = None
-    erro = None
-    for tentativa in range(1, tentativas + 1):
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                bruto = resp.read().decode("utf-8", "replace")
-            break
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
-            erro = e
-            if tentativa < tentativas:
-                print(c("33", f" crt.sh não respondeu (tentativa {tentativa}/{tentativas})"
-                               f", tentando de novo..."))
-    if bruto is None:
-        print(c("31", f" crt.sh indisponível agora ({type(erro).__name__}). "
-                       "Seguindo só com a lista de subdomínios comuns."))
-        return set()
-    try:
-        dados = json.loads(bruto)
-    except ValueError:
-        # crt.sh às vezes devolve vários objetos JSON colados sem vírgula.
-        dados = []
-        for pedaco in bruto.replace("}{", "}\n{").splitlines():
-            try:
-                dados.append(json.loads(pedaco))
-            except ValueError:
-                pass
-    achados = set()
-    dominio_suf = "." + dominio
-    for item in dados:
-        nome = item.get("name_value", "") if isinstance(item, dict) else ""
-        for linha in nome.split("\n"):
-            linha = linha.strip().lower().lstrip("*.")
-            if linha and (linha == dominio or linha.endswith(dominio_suf)):
-                achados.add(linha)
-    return achados
-
-
-async def resolver_varios(hosts, threads=40):
-    """Resolve IP de vários hosts em paralelo (socket é bloqueante, roda em
-    threads por baixo do asyncio)."""
-    loop = asyncio.get_event_loop()
-    sem = asyncio.Semaphore(threads)
-
-    async def um(host):
-        async with sem:
-            ip = await loop.run_in_executor(None, resolver_ip, host)
-            return host, ip
-
-    return await asyncio.gather(*(um(h) for h in hosts))
-
-
-async def buscar_subdominios(dominio_bruto):
-    """Fluxo completo: busca subdomínios (crt.sh + lista de comuns),
-    resolve o IP de cada um e mostra/salva o resultado. O crt.sh pode
-    estar lento ou fora do ar; a lista de comuns garante um resultado
-    mínimo mesmo assim, já que é só DNS direto."""
-    dominio = normalizar_dominio(dominio_bruto)
-    print()
-    etapa(f"Subdomínios de {dominio}")
-    print(c("2", " Consultando certificados públicos (crt.sh)..."), flush=True)
-    nomes_crt = crtsh_subdominios(dominio)
-    if nomes_crt:
-        print(c("2", f" {len(nomes_crt)} subdomínio(s) via crt.sh."))
-    print(c("2", " Testando lista de subdomínios comuns (DNS direto)..."))
-    nomes = sorted(nomes_crt | wordlist_subdominios(dominio))
-    print(c("2", f" {len(nomes)} nome(s) no total. Resolvendo IPs..."))
-    print()
-    resultados = await resolver_varios(nomes)
-    ok = sorted((h, ip) for h, ip in resultados if ip)
-    sem_ip = len(resultados) - len(ok)
-    if not ok:
-        print(c("33", " Nenhum subdomínio respondeu (nem via crt.sh, nem os comuns)."))
-        print()
-        return
-    largura = min(max((len(h) for h, _ in ok), default=20), 42)
-    for host, ip in ok:
-        print(f" {c('1;32', '✔')} {c('1', host.ljust(largura))}  {c('36', ip)}")
-
-    print()
-    line("═", "1;36")
-    print(c("1;97", " RESULTADO"))
-    line("═", "1;36")
-    print(f" {c('2', 'Encontrados')}  {fmt(len(nomes))}    "
-          f"{c('2', 'Resolvidos')}  {c('1;32', fmt(len(ok)))}    "
-          f"{c('2', 'Sem resposta')}  {fmt(sem_ip)}")
-
-    if ok:
-        caminho = output_path(f"subdominios_{sanitizar_nome_arquivo(dominio)}.txt")
-        with open(caminho, "w", encoding="utf-8") as f:
-            for host, ip in ok:
-                f.write(f"{host};{ip}\n")
-        print()
-        print(c("1", " Arquivo salvo:"))
-        print(f"   {c('36', caminho)} {c('2', f'({len(ok)})')}")
-    print()
-
-
 def agrupar_por_host_sni(hits_subset):
     """Agrupa uma lista de hits (mesma porta/modo) por par (host, sni),
     devolvendo [((host, sni), [ips...]), ...] do maior pro menor."""
@@ -2097,37 +1939,8 @@ def ask_num(texto, padrao, tipo=int):
             print(c("31", " Digite um número válido."))
 
 
-def menu_principal():
+def show_menu(provs):
     banner()
-    subtitulo("scanner de IPs por CDN + ferramentas de rede")
-    print()
-    print(c("1", " O que você quer fazer?"))
-    line()
-    opcao("1", "Buscar subdomínio", "domínio  →  lista de subdomínios + IP")
-    opcao("2", "Buscar IP", "domínio/host  →  só o IP dele")
-    opcao("3", "Scanner por CDN", "varre as faixas de IP de um provedor")
-    line()
-    print(f" {c('36', ' q)')} sair")
-    print()
-
-
-def buscar_ip_unico():
-    """Resolve o IP de um único host/domínio digitado (como um 'nslookup')."""
-    etapa("Buscar IP")
-    host = normalizar_dominio(pedir_texto("Domínio ou host (ex.: vivo.com.br)"))
-    print(c("2", f" Resolvendo {host}..."), flush=True)
-    ip = resolver_ip(host)
-    print()
-    if ip:
-        print(f" {c('1;32', '✔')} {c('1', host)}  {c('36', ip)}")
-    else:
-        print(c("33", f" Não foi possível resolver {host} (não existe ou não respondeu)."))
-    print()
-
-
-def menu_cdn(provs):
-    banner()
-    subtitulo("scanner por CDN / provedor")
     print()
     print(c("1", " Escolha a CDN / provedor"))
     line()
@@ -2144,74 +1957,30 @@ def menu_cdn(provs):
         for i, p in enumerate(provs, 1):
             print(f" {c('36', f'{i:>2})')} {p['name']}")
     line()
-    print(f" {c('36', ' 0)')} TODOS        {c('36', ' v)')} voltar")
+    print(f" {c('36', ' 0)')} TODOS        {c('36', ' q)')} sair")
     print()
-
-
-def escolher_cdns(provs):
-    """Submenu de seleção de CDN. Devolve a lista de nomes escolhidos,
-    ou None se o usuário pediu para voltar ao menu principal."""
-    while True:
-        menu_cdn(provs)
-        try:
-            esc = input(c("1;36", " ❯ ") + "Número da CDN (ex.: 5 ou 1,4,7), 0 = todos, v = voltar: ").strip().lower()
-        except EOFError:
-            return None
-        if esc in ("v", "voltar", "q", "sair"):
-            return None
-        if esc == "0":
-            return [p["name"] for p in provs]
-        nomes = []
-        for x in esc.replace(" ", "").split(","):
-            if x.isdigit() and 1 <= int(x) <= len(provs):
-                nomes.append(provs[int(x) - 1]["name"])
-        if nomes:
-            return nomes
-        print(c("31", "\n Opção inválida.\n"))
 
 
 def interactive(base):
     provs = load_providers(base.providers)
     while True:
-        menu_principal()
+        show_menu(provs)
         try:
-            esc = input(c("1;36", " ❯ ") + "Opção [1/2/3/q]: ").strip().lower()
+            esc = input(c("1;36", " ❯ ") + "Número da CDN (ex.: 5 ou 1,4,7): ").strip().lower()
         except EOFError:
             return None
         if esc in ("q", "sair", "exit"):
             return None
-
-        if esc in ("1", "s", "sub", "subdominio", "subdomínio"):
-            dominio = pedir_texto("Domínio para buscar subdomínios (ex.: exemplo.com)")
-            try:
-                asyncio.run(buscar_subdominios(dominio))
-            except KeyboardInterrupt:
-                print()
-            try:
-                input(c("2", " Enter para voltar ao menu..."))
-            except EOFError:
-                return None
-            continue
-
-        if esc in ("2", "ip"):
-            try:
-                buscar_ip_unico()
-            except KeyboardInterrupt:
-                print()
-            try:
-                input(c("2", " Enter para voltar ao menu..."))
-            except EOFError:
-                return None
-            continue
-
-        if esc not in ("3", "scanner", "cdn"):
-            print(c("31", "\n Opção inválida.\n"))
-            continue
-
-        nomes = escolher_cdns(provs)
-        if nomes is None:
-            continue   # volta ao menu principal
-        break
+        if esc == "0":
+            nomes = [p["name"] for p in provs]
+        else:
+            nomes = []
+            for x in esc.replace(" ", "").split(","):
+                if x.isdigit() and 1 <= int(x) <= len(provs):
+                    nomes.append(provs[int(x) - 1]["name"])
+        if nomes:
+            break
+        print(c("31", "\n Opção inválida.\n"))
 
     args = copy.copy(base)
     args.provider = nomes
@@ -2420,10 +2189,6 @@ def build_parser():
     g2.add_argument("--salvar-perfil", metavar="NOME", help="salva modo/host/sni/payload atuais como um perfil de rede")
     g2.add_argument("--usar-perfil", metavar="NOME", help="carrega um perfil salvo (modo/host/sni/payload) antes de rodar")
     g2.add_argument("--listar-perfis", action="store_true", help="lista os perfis salvos e sai")
-
-    g3 = p.add_argument_group("subdomínio")
-    g3.add_argument("--subdominio", metavar="DOMINIO",
-                     help="busca subdomínios desse domínio (crt.sh) e resolve o IP de cada um")
     return p
 
 
@@ -2436,13 +2201,6 @@ def main():
     if args.diag:
         try:
             asyncio.run(diag(args))
-        except KeyboardInterrupt:
-            pass
-        return
-
-    if args.subdominio:
-        try:
-            asyncio.run(buscar_subdominios(args.subdominio))
         except KeyboardInterrupt:
             pass
         return
@@ -2499,4 +2257,16 @@ def main():
         return
 
     try:
-  
+        if args.modo:
+            aplicar_padroes_combo(args)
+            args.port_ssl, args.port_ssh = 443, 80
+            args.tentativas = max(1, args.tentativas)
+            asyncio.run(run_combo(args))
+        else:
+            asyncio.run(run(args))
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
