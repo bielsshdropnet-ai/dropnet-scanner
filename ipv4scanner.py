@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-DROPNET SCANNER v3.0
+DROPNET SCANNER v3.1
 Varre faixas de CDNs/provedores e separa os IPs por porta (80 / 443).
+
+Novidades da v3.1:
+  - Menu inicial com cabeçalho e opções renumeradas/mais claras
+  - Nova busca de subdomínio: digite um domínio e o script lista os
+    subdomínios conhecidos (via crt.sh) já com o IP de cada um
+    (menu: opção "s", ou --subdominio dominio.com fora do menu)
 
 Novidades da v3.0:
   - Vários Host/SNI em rotate: ao perguntar Host ou SNI no menu, agora dá
@@ -86,12 +92,15 @@ import os
 import random
 import re
 import shutil
+import socket
 import ssl
 import sys
 import textwrap
 import time
+import urllib.error
+import urllib.request
 
-VERSION = "3.0"
+VERSION = "3.1"
 # Pasta fixa para salvar automaticamente os resultados no Android/Termux.
 # O caminho ~/storage/downloads é o atalho criado pelo termux-setup-storage.
 OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "storage", "downloads", "DROPNET-SCANNER")
@@ -439,6 +448,10 @@ def banner():
     print(c("1;36", "║") + c("1;97", "D R O P N E T".center(w)) + c("1;36", "║"))
     print(c("1;36", "║") + c("36", f"S C A N N E R   v{VERSION}".center(w)) + c("1;36", "║"))
     print(c("1;36", "╚" + "═" * w + "╝"))
+
+
+def subtitulo(txt):
+    print(c("2", txt.center(min(term_width() - 1, 38))))
 
 
 def line(ch="─", color="2"):
@@ -1772,6 +1785,114 @@ def sanitizar_nome_arquivo(s):
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", s).strip("_")[:40] or "x"
 
 
+# ============================ subdomínios ============================
+# Busca subdomínios conhecidos de um domínio (via certificados públicos,
+# crt.sh) e resolve o IP de cada um. Só biblioteca padrão.
+def resolver_ip(host):
+    """Resolve um host para IPv4. Devolve None se não existir/não responder."""
+    try:
+        return socket.gethostbyname(host)
+    except OSError:
+        return None
+
+
+def normalizar_dominio(texto):
+    """Aceita 'https://exemplo.com/path', 'www.exemplo.com' etc. e devolve
+    só o domínio limpo, em minúsculas."""
+    texto = texto.strip().lower()
+    texto = re.sub(r"^[a-z]+://", "", texto)
+    texto = texto.split("/", 1)[0]
+    texto = texto.split(":", 1)[0]
+    return texto.lstrip(".")
+
+
+def crtsh_subdominios(dominio, timeout=12):
+    """Consulta o crt.sh (certificados TLS públicos já emitidos) e devolve
+    o conjunto de subdomínios encontrados para esse domínio."""
+    url = f"https://crt.sh/?q=%25.{dominio}&output=json"
+    req = urllib.request.Request(url, headers={"User-Agent": APP_UA})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            bruto = resp.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        print(c("31", f" Não foi possível consultar o crt.sh ({type(e).__name__})."))
+        return set()
+    try:
+        dados = json.loads(bruto)
+    except ValueError:
+        # crt.sh às vezes devolve vários objetos JSON colados sem vírgula.
+        dados = []
+        for pedaco in bruto.replace("}{", "}\n{").splitlines():
+            try:
+                dados.append(json.loads(pedaco))
+            except ValueError:
+                pass
+    achados = set()
+    dominio_suf = "." + dominio
+    for item in dados:
+        nome = item.get("name_value", "") if isinstance(item, dict) else ""
+        for linha in nome.split("\n"):
+            linha = linha.strip().lower().lstrip("*.")
+            if linha and (linha == dominio or linha.endswith(dominio_suf)):
+                achados.add(linha)
+    return achados
+
+
+async def resolver_varios(hosts, threads=40):
+    """Resolve IP de vários hosts em paralelo (socket é bloqueante, roda em
+    threads por baixo do asyncio)."""
+    loop = asyncio.get_event_loop()
+    sem = asyncio.Semaphore(threads)
+
+    async def um(host):
+        async with sem:
+            ip = await loop.run_in_executor(None, resolver_ip, host)
+            return host, ip
+
+    return await asyncio.gather(*(um(h) for h in hosts))
+
+
+async def buscar_subdominios(dominio_bruto):
+    """Fluxo completo: busca subdomínios no crt.sh, resolve o IP de cada um
+    e mostra/salva o resultado."""
+    dominio = normalizar_dominio(dominio_bruto)
+    print()
+    etapa(f"Subdomínios de {dominio}")
+    print(c("2", " Consultando certificados públicos (crt.sh)..."), flush=True)
+    nomes = crtsh_subdominios(dominio)
+    if not nomes:
+        print(c("33", " Nenhum subdomínio encontrado (ou o crt.sh não respondeu)."))
+        print()
+        return
+    nomes = sorted(nomes)
+    print(c("2", f" {len(nomes)} subdomínio(s) encontrados. Resolvendo IPs..."))
+    print()
+    resultados = await resolver_varios(nomes)
+    ok = sorted((h, ip) for h, ip in resultados if ip)
+    sem_ip = len(resultados) - len(ok)
+    largura = min(max((len(h) for h, _ in ok), default=20), 42)
+    for host, ip in ok:
+        print(f" {c('1;32', '✔')} {c('1', host.ljust(largura))}  {c('36', ip)}")
+
+    print()
+    line("═", "1;36")
+    print(c("1;97", " RESULTADO"))
+    line("═", "1;36")
+    print(f" {c('2', 'Encontrados')}  {fmt(len(nomes))}    "
+          f"{c('2', 'Resolvidos')}  {c('1;32', fmt(len(ok)))}    "
+          f"{c('2', 'Sem resposta')}  {fmt(sem_ip)}")
+
+    if ok:
+        caminho = output_path(f"subdominios_{sanitizar_nome_arquivo(dominio)}.txt")
+        with open(caminho, "w", encoding="utf-8") as f:
+            for host, ip in ok:
+                f.write(f"{host};{ip}\n")
+        print()
+        print(c("1", " Arquivo salvo:"))
+        print(f"   {c('36', caminho)} {c('2', f'({len(ok)})')}")
+    print()
+
+
 def agrupar_por_host_sni(hits_subset):
     """Agrupa uma lista de hits (mesma porta/modo) por par (host, sni),
     devolvendo [((host, sni), [ips...]), ...] do maior pro menor."""
@@ -1941,6 +2062,7 @@ def ask_num(texto, padrao, tipo=int):
 
 def show_menu(provs):
     banner()
+    subtitulo("scanner de IPs por CDN + ferramentas de rede")
     print()
     print(c("1", " Escolha a CDN / provedor"))
     line()
@@ -1957,6 +2079,9 @@ def show_menu(provs):
         for i, p in enumerate(provs, 1):
             print(f" {c('36', f'{i:>2})')} {p['name']}")
     line()
+    print(c("1", " Ferramentas"))
+    print(f" {c('36', ' s)')} Buscar subdomínio  {c('2', '· domínio → subdomínios + IP')}")
+    line()
     print(f" {c('36', ' 0)')} TODOS        {c('36', ' q)')} sair")
     print()
 
@@ -1966,11 +2091,22 @@ def interactive(base):
     while True:
         show_menu(provs)
         try:
-            esc = input(c("1;36", " ❯ ") + "Número da CDN (ex.: 5 ou 1,4,7): ").strip().lower()
+            esc = input(c("1;36", " ❯ ") + "Número da CDN, 's' (subdomínio) ou 'q' (sair): ").strip().lower()
         except EOFError:
             return None
         if esc in ("q", "sair", "exit"):
             return None
+        if esc in ("s", "sub", "subdominio", "subdomínio"):
+            dominio = pedir_texto("Domínio para buscar subdomínios (ex.: exemplo.com)")
+            try:
+                asyncio.run(buscar_subdominios(dominio))
+            except KeyboardInterrupt:
+                print()
+            try:
+                input(c("2", " Enter para voltar ao menu..."))
+            except EOFError:
+                return None
+            continue
         if esc == "0":
             nomes = [p["name"] for p in provs]
         else:
@@ -2189,6 +2325,10 @@ def build_parser():
     g2.add_argument("--salvar-perfil", metavar="NOME", help="salva modo/host/sni/payload atuais como um perfil de rede")
     g2.add_argument("--usar-perfil", metavar="NOME", help="carrega um perfil salvo (modo/host/sni/payload) antes de rodar")
     g2.add_argument("--listar-perfis", action="store_true", help="lista os perfis salvos e sai")
+
+    g3 = p.add_argument_group("subdomínio")
+    g3.add_argument("--subdominio", metavar="DOMINIO",
+                     help="busca subdomínios desse domínio (crt.sh) e resolve o IP de cada um")
     return p
 
 
@@ -2201,6 +2341,13 @@ def main():
     if args.diag:
         try:
             asyncio.run(diag(args))
+        except KeyboardInterrupt:
+            pass
+        return
+
+    if args.subdominio:
+        try:
+            asyncio.run(buscar_subdominios(args.subdominio))
         except KeyboardInterrupt:
             pass
         return
