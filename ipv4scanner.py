@@ -3,6 +3,14 @@
 DROPNET SCANNER v3.0
 Varre faixas de CDNs/provedores e separa os IPs por porta (80 / 443).
 
+Novidades da v3.1:
+  - Modo ROOT (SYN scan): com --root (ou escolhendo no menu), uma pré-varredura
+    manda só pacotes SYN (half-open, via raw socket) e descobre quais IPs têm
+    a porta aberta MUITO mais rápido. Depois só esses IPs passam pelo teste
+    real (payload / Host / SNI), que continua igual. Sem root, tudo funciona
+    como antes (modo normal). Requer root: rode com "tsu" ou "su" no Termux
+  - Novos: --rate (pacotes/s, padrão 1500) e --syn-espera (s, padrão 3)
+
 Novidades da v3.0:
   - Vários Host/SNI em rotate: ao perguntar Host ou SNI no menu, agora dá
     pra adicionar mais de um ("Adicionar outro?"). Com 2+ valores, um
@@ -68,6 +76,7 @@ Uso:
   python dropnet_scanner.py --avancado      -> menu com mais opções
   python dropnet_scanner.py --cidr 1.2.3.0/24 --tcp --ports 80,443
   python dropnet_scanner.py --provider azion --tcp --ports 80,443
+  tsu -c "python dropnet_scanner.py --provider azion --tcp --ports 80,443 --root"
   python dropnet_scanner.py --hosts hosts.txt --port 443 --tls --status "101;200"
 
 Só biblioteca padrão (roda no Termux). Use apenas em faixas que você
@@ -86,12 +95,16 @@ import os
 import random
 import re
 import shutil
+import socket
 import ssl
+import struct
 import sys
 import textwrap
+import threading
 import time
+import zlib
 
-VERSION = "3.0"
+VERSION = "3.1"
 # Pasta fixa para salvar automaticamente os resultados no Android/Termux.
 # O caminho ~/storage/downloads é o atalho criado pelo termux-setup-storage.
 OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "storage", "downloads", "DROPNET-SCANNER")
@@ -704,9 +717,179 @@ async def open_conn(target, args, ssl_ctx, port=None, use_tls=None, host_sni=Non
     )
 
 
+# ============================ modo root (SYN scan) ============================
+SYN_ABERTOS = None   # None = modo normal; dict ip -> set(portas) após a pré-varredura SYN
+
+
+def tem_root():
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def syn_permite(ip, porta):
+    """Modo normal: sempre True. Modo root: só se o SYN scan viu a porta aberta."""
+    return SYN_ABERTOS is None or porta in SYN_ABERTOS.get(ip, ())
+
+
+def _checksum(data):
+    if len(data) % 2:
+        data += b"\0"
+    s = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    s = (s >> 16) + (s & 0xFFFF)
+    s += s >> 16
+    return ~s & 0xFFFF
+
+
+def _pacote_syn(src, dst, sport, dport, seq):
+    off_flags = (5 << 12) | 0x02          # cabeçalho de 20 bytes, flag SYN
+    hdr = struct.pack("!HHLLHHHH", sport, dport, seq, 0, off_flags, 65535, 0, 0)
+    pseudo = socket.inet_aton(src) + socket.inet_aton(dst) + struct.pack("!BBH", 0, 6, len(hdr))
+    ck = _checksum(pseudo + hdr)
+    return struct.pack("!HHLLHHHH", sport, dport, seq, 0, off_flags, 65535, ck, 0)
+
+
+def _seq_de(ip, porta, salt):
+    # sem estado: o seq é derivado do alvo, então dá pra validar a resposta
+    return zlib.crc32(f"{ip}:{porta}".encode(), salt) & 0xFFFFFFFF
+
+
+def _ip_origem():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("1.1.1.1", 53))
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+
+def _receptor_syn(rsock, parar, achados, sport, salt):
+    while not parar.is_set():
+        try:
+            b = rsock.recv(2048)
+        except socket.timeout:
+            continue
+        except OSError:
+            return
+        if len(b) < 40:
+            continue
+        ihl = (b[0] & 0x0F) * 4
+        if len(b) < ihl + 20:
+            continue
+        ip = socket.inet_ntoa(b[12:16])
+        tsp, tdp, _seq, ack, of = struct.unpack("!HHLLH", b[ihl:ihl + 14])
+        if tdp != sport or (of & 0x12) != 0x12:      # precisa ser SYN+ACK p/ a nossa porta
+            continue
+        if ack != (_seq_de(ip, tsp, salt) + 1) & 0xFFFFFFFF:
+            continue
+        achados.setdefault(ip, set()).add(tsp)
+
+
+async def syn_prescan(args, cidrs, portas):
+    """Pré-varredura SYN (half-open) com raw socket. Precisa de root."""
+    rate = max(50, int(getattr(args, "rate", 1500) or 1500))
+    espera = float(getattr(args, "syn_espera", 3.0) or 3.0)
+    src = _ip_origem()
+    salt = random.getrandbits(32)
+    sport = random.randint(40000, 59999)
+    ssock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+    rsock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+    try:
+        rsock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
+    except OSError:
+        pass
+    rsock.settimeout(0.3)
+    achados = {}
+    parar = threading.Event()
+    th = threading.Thread(target=_receptor_syn, args=(rsock, parar, achados, sport, salt), daemon=True)
+    th.start()
+    total = total_ips(cidrs) * len(portas)
+    enviados = 0
+    t0 = time.monotonic()
+    try:
+        for ip in iter_targets(cidrs, 0, False):
+            for porta in portas:
+                try:
+                    ssock.sendto(_pacote_syn(src, ip, sport, porta, _seq_de(ip, porta, salt)), (ip, 0))
+                except OSError:
+                    pass
+                enviados += 1
+            if enviados % 200 < len(portas):
+                ideal = enviados / rate
+                real = time.monotonic() - t0
+                await asyncio.sleep(max(0.0, ideal - real))
+                if UI.color:
+                    n = sum(len(v) for v in achados.values())
+                    sys.stdout.write(f"\r\033[K SYN {fmt(enviados)}/{fmt(total)} · abertas: {n}")
+                    sys.stdout.flush()
+        # espera as últimas respostas chegarem
+        fim = time.monotonic() + espera
+        while time.monotonic() < fim:
+            await asyncio.sleep(0.2)
+    finally:
+        parar.set()
+        th.join(1)
+        ssock.close()
+        rsock.close()
+        if UI.color:
+            sys.stdout.write("\r\033[K")
+    return achados
+
+
+async def preparar_root(args, portas):
+    """Liga/desliga o modo root para este scan. Sem root, cai no modo normal."""
+    global SYN_ABERTOS
+    SYN_ABERTOS = None
+    if not getattr(args, "root", False):
+        return
+    if not tem_root():
+        print(c("33", " Modo root pedido, mas o script não está rodando como root."))
+        print(c("33", "  No Termux: abra com 'tsu' (ou 'su') e rode de novo. Usando modo normal."))
+        return
+    if args.hosts:
+        print(c("33", " Modo root não vale com --hosts (precisa de faixas CIDR). Usando modo normal."))
+        return
+    if args.max_ips:
+        print(c("33", " Modo root varre a faixa inteira; ignora --max-ips. Usando modo normal."))
+        return
+    cidrs = coletar_cidrs(args)
+    portas = sorted(set(portas))
+    print(c("1;36", f" Modo ROOT: SYN scan em {fmt(total_ips(cidrs))} IPs · portas {','.join(map(str, portas))}"
+                    f" · {args.rate} pacotes/s"))
+    t0 = time.monotonic()
+    try:
+        SYN_ABERTOS = await syn_prescan(args, cidrs, portas)
+    except PermissionError:
+        SYN_ABERTOS = None
+        print(c("33", " Sem permissão para raw socket. Usando modo normal."))
+        return
+    except OSError as e:
+        SYN_ABERTOS = None
+        print(c("33", f" Raw socket indisponível ({e}). Usando modo normal."))
+        return
+    n = sum(len(v) for v in SYN_ABERTOS.values())
+    print(c("32", f" SYN scan: {len(SYN_ABERTOS)} IPs com porta aberta ({n} portas) em {int(time.monotonic() - t0)}s"))
+    if getattr(args, "rapido", False):
+        args.rapido = False   # com SYN scan o modo rápido não é necessário
+
+
+def ask_metodo(args):
+    """Pergunta no menu: sem root (normal) ou root (SYN)."""
+    if not tem_root():
+        print(c("2", " (Modo root indisponível: abra o Termux com 'tsu' para usar SYN scan.)"))
+        args.root = False
+        return
+    etapa("Método de varredura")
+    opcao("1", "Normal".ljust(12), "sem root · conexão completa")
+    opcao("2", "Root (SYN)".ljust(12), "bem mais rápido · pré-varredura half-open")
+    line()
+    args.root = escolher("Método", ("1", "2"), "2") == "2"
+
+
 async def probe_tcp(target, args, ports):
     """Só confere quais portas abrem (igual à aba Scanner do app)."""
     t0 = time.monotonic()
+    ports = [p for p in ports if syn_permite(target, p)]
+    if not ports:
+        return None
 
     async def uma(porta):
         w = None
@@ -736,6 +919,8 @@ async def probe_tcp(target, args, ports):
 
 async def probe_http(target, args, ssl_ctx, ranges, port=None, use_tls=None, tries=1):
     port = port or args.port
+    if not syn_permite(target, port):
+        return None
     use_tls = args.tls if use_tls is None else use_tls
     payload = build_payload(args, target)
     t0 = time.monotonic()
@@ -836,6 +1021,7 @@ async def run(args):
     if precisa_tls:
         ssl_ctx = make_ssl_ctx(args)
 
+    await preparar_root(args, ports if args.tcp else [args.port])
     aviso_rapido(args)
     cp = Checkpoint(args, "run")
     PARCIAL_MANTER[0] = cp.retomou
@@ -1585,6 +1771,8 @@ def listar_perfis():
 
 async def probe_combo(target, args, ssl_ctx, ranges, modo, porta, host_sni=None):
     """Testa uma combinação de modo/porta usando o par HOST/SNI informado."""
+    if not syn_permite(target, porta):
+        return None
     use_tls = modo == "ssl"
     payload = build_payload(args, target, args.payload_ssh if modo == "ssh" else args.payload,
                             host_sni=host_sni)
@@ -1648,6 +1836,7 @@ async def run_combo(args):
     conexoes_por_ip = max(1, len(combos) * len(host_sni_pairs))
     threads = max(1, min(args.threads, (nofile - 64) // conexoes_por_ip))
 
+    await preparar_root(args, [p for _, p in combos])
     aviso_rapido(args)
     cp = Checkpoint(args, "combo")
     PARCIAL_MANTER[0] = cp.retomou
@@ -1984,6 +2173,7 @@ def interactive(base):
 
     args = copy.copy(base)
     args.provider = nomes
+    ask_metodo(args)
     args.tcp = True
     # A aba Scanner do APK identifica portas TCP abertas; não exige HTTP 101.
     # A confirmação HTTP fica disponível separadamente com --confirmar / modo avançado.
@@ -2178,6 +2368,9 @@ def build_parser():
     r.add_argument("--rapido-amostras", type=int, default=3, help="amostras por bloco /24 no modo rápido")
     r.add_argument("--retomar", action="store_true", help="retoma automaticamente o último scan interrompido")
     r.add_argument("--novo", action="store_true", help="ignora o progresso salvo e começa do zero")
+    r.add_argument("--root", action="store_true", help="modo root: pré-varredura SYN (raw socket, precisa de root); sem root cai no modo normal")
+    r.add_argument("--rate", type=int, default=1500, help="pacotes SYN por segundo no modo root (padrão 1500)")
+    r.add_argument("--syn-espera", type=float, default=3.0, help="segundos esperando respostas após o último SYN (padrão 3)")
     r.add_argument("--no-color", action="store_true", help="sem cores")
 
     g2 = p.add_argument_group("gerar payload / testar hosts / perfis")
