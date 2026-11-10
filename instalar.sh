@@ -21,6 +21,7 @@ info() { printf "${CIAN} ➜ %s${RST}\n" "$*"; }
 aviso(){ printf "${AMAR} ! %s${RST}\n" "$*"; }
 erro() { printf "${VERM} ✖ %s${RST}\n" "$*"; }
 
+main() {
 if ! command -v pkg >/dev/null 2>&1; then
     erro "Este instalador é para o Termux (comando 'pkg' não encontrado)."
     exit 1
@@ -35,25 +36,23 @@ printf "${CIAN}╔════════════════════�
 
 # ---------- 1) atualizar o Termux ----------
 info "1/5  Atualizando o Termux (pode demorar um pouco)..."
-export DEBIAN_FRONTEND=noninteractive
-pkg update -y >/dev/null 2>&1 || apt-get update -y >/dev/null 2>&1 || aviso "Não consegui atualizar a lista de pacotes (sem internet?). Continuando..."
-apt-get -y -o Dpkg::Options::="--force-confold" upgrade >/dev/null 2>&1 || aviso "Upgrade parcial. Continuando..."
+pkg update -y </dev/null && pkg upgrade -y </dev/null || aviso "Atualização com avisos. Continuando..."
 ok "Termux atualizado"
 
 # ---------- 2) dependências ----------
 info "2/5  Instalando python, git, curl, wget e root (tsu)..."
-pkg install -y python git curl wget >/dev/null 2>&1
+pkg install python git curl wget -y </dev/null
 if ! command -v python >/dev/null 2>&1; then
-    erro "Falhou instalar o Python. Verifique a internet e rode de novo."
+    erro "Falhou instalar o Python (veja o erro acima). Se for mirror, rode 'termux-change-repo' e tente de novo."
     exit 1
 fi
-pkg install -y tsu termux-tools >/dev/null 2>&1 || aviso "Não consegui instalar o 'tsu' (só afeta o modo root)."
+pkg install tsu termux-tools -y </dev/null || aviso "Não consegui instalar o 'tsu' (só afeta o modo root)."
 ok "Python $(python -V 2>&1 | awk '{print $2}') · git $(git --version 2>/dev/null | awk '{print $3}')"
 
 # ---------- 3) armazenamento ----------
 info "3/5  Liberando acesso ao armazenamento (onde ficam os resultados)..."
 if [ ! -d "$HOME/storage/downloads" ]; then
-    termux-setup-storage >/dev/null 2>&1
+    termux-setup-storage </dev/null >/dev/null 2>&1
     aviso "Se aparecer um pedido de permissão na tela, toque em PERMITIR."
     for _ in 1 2 3 4 5 6 7 8 9 10; do
         [ -d "$HOME/storage/downloads" ] && break
@@ -71,7 +70,7 @@ fi
 info "4/5  Baixando o scanner do GitHub..."
 PROV_ANTIGO=""
 if [ -d "$DIR/.git" ]; then
-    ( cd "$DIR" && git pull --ff-only ) >/dev/null 2>&1 && ok "Repositório atualizado (git pull)" \
+    ( cd "$DIR" && git pull --ff-only </dev/null ) && ok "Repositório atualizado (git pull)" \
         || aviso "git pull falhou (alterações locais?). Mantendo os arquivos atuais."
 else
     if [ -d "$DIR" ]; then
@@ -79,7 +78,7 @@ else
         mv "$DIR" "$DIR.bak.$(date +%s)"
         aviso "Pasta antiga (sem git) guardada como $DIR.bak.*"
     fi
-    if git clone "$REPO_URL" "$DIR" >/dev/null 2>&1; then
+    if git clone "$REPO_URL" "$DIR" </dev/null; then
         ok "Repositório clonado"
     else
         aviso "Não consegui clonar o GitHub (sem internet ou repositório privado)."
@@ -169,3 +168,5 @@ if { true </dev/tty; } 2>/dev/null; then
         *) exec dropnet ;;
     esac
 fi
+}
+main "$@"
