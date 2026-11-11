@@ -21,40 +21,6 @@ info() { printf "${CIAN} ➜ %s${RST}\n" "$*"; }
 aviso(){ printf "${AMAR} ! %s${RST}\n" "$*"; }
 erro() { printf "${VERM} ✖ %s${RST}\n" "$*"; }
 
-LOG="$HOME/.dropnet_install.log"
-: > "$LOG" 2>/dev/null
-
-# barra_rodar "texto" fatal(1/0) "comando"
-# Roda o comando em segundo plano e mostra uma barra contando 0% → 100%.
-barra_rodar() {
-    local texto="$1" fatal="$2" cmd="$3" pct=0 w=30 cheio i barra rc
-    bash -c "$cmd" </dev/null >>"$LOG" 2>&1 &
-    local pid=$!
-    while kill -0 "$pid" 2>/dev/null; do
-        pct=$(( pct + (99 - pct) / 25 ))
-        [ "$pct" -gt 99 ] && pct=99
-        cheio=$(( pct * w / 100 )); barra=""
-        for ((i=0;i<w;i++)); do [ "$i" -lt "$cheio" ] && barra+="█" || barra+="░"; done
-        printf "\r${CIAN} %s [%s] %3d%%${RST}\033[K" "$texto" "$barra" "$pct"
-        sleep 0.5
-    done
-    wait "$pid"; rc=$?
-    if [ "$rc" -eq 0 ]; then
-        barra=""; for ((i=0;i<w;i++)); do barra+="█"; done
-        printf "\r${VERDE} %s [%s] 100%%${RST}\033[K\n" "$texto" "$barra"
-        return 0
-    fi
-    printf "\r\033[K"
-    if [ "$fatal" = "1" ]; then
-        erro "$texto falhou. Últimas linhas do erro:"
-        tail -n 8 "$LOG" | sed 's/^/    /'
-        erro "Log completo: $LOG"
-    else
-        aviso "$texto terminou com avisos (continuando). Log: $LOG"
-    fi
-    return "$rc"
-}
-
 main() {
 if ! command -v pkg >/dev/null 2>&1; then
     erro "Este instalador é para o Termux (comando 'pkg' não encontrado)."
@@ -70,20 +36,17 @@ printf "${CIAN}╔════════════════════�
 
 # ---------- 1) atualizar o Termux ----------
 info "1/5  Atualizando o Termux (pode demorar um pouco)..."
-barra_rodar "Atualizando " 0 "pkg update -y && pkg upgrade -y"
+pkg update -y </dev/null && pkg upgrade -y </dev/null || aviso "Atualização com avisos. Continuando..."
 ok "Termux atualizado"
 
 # ---------- 2) dependências ----------
 info "2/5  Instalando python, git, curl, wget e root (tsu)..."
-barra_rodar "Instalando  " 1 "pkg install python git curl wget -y" || {
-    erro "Se for mirror lento, rode 'termux-change-repo' e tente de novo."
-    exit 1
-}
+pkg install python git curl wget -y </dev/null
 if ! command -v python >/dev/null 2>&1; then
-    erro "Python não ficou instalado. Rode 'termux-change-repo' e tente de novo (log: $LOG)."
+    erro "Falhou instalar o Python (veja o erro acima). Se for mirror, rode 'termux-change-repo' e tente de novo."
     exit 1
 fi
-barra_rodar "Instalando root (tsu)" 0 "pkg install tsu termux-tools -y"
+pkg install tsu termux-tools -y </dev/null || aviso "Não consegui instalar o 'tsu' (só afeta o modo root)."
 ok "Python $(python -V 2>&1 | awk '{print $2}') · git $(git --version 2>/dev/null | awk '{print $3}')"
 
 # ---------- 3) armazenamento ----------
@@ -107,8 +70,7 @@ fi
 info "4/5  Baixando o scanner do GitHub..."
 PROV_ANTIGO=""
 if [ -d "$DIR/.git" ]; then
-    barra_rodar "Atualizando repositório" 0 "cd '$DIR' && git pull --ff-only" \
-        && ok "Repositório atualizado (git pull)" \
+    ( cd "$DIR" && git pull --ff-only </dev/null ) && ok "Repositório atualizado (git pull)" \
         || aviso "git pull falhou (alterações locais?). Mantendo os arquivos atuais."
 else
     if [ -d "$DIR" ]; then
@@ -116,7 +78,7 @@ else
         mv "$DIR" "$DIR.bak.$(date +%s)"
         aviso "Pasta antiga (sem git) guardada como $DIR.bak.*"
     fi
-    if barra_rodar "Baixando do GitHub" 0 "git clone '$REPO_URL' '$DIR'"; then
+    if git clone "$REPO_URL" "$DIR" </dev/null; then
         ok "Repositório clonado"
     else
         aviso "Não consegui clonar o GitHub (sem internet ou repositório privado)."
