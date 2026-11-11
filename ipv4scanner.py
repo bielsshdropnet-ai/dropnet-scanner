@@ -3,6 +3,13 @@
 DROPNET SCANNER v3.0
 Varre faixas de CDNs/provedores e separa os IPs por porta (80 / 443).
 
+Novidades da v3.2:
+  - Modo root: --syn-passes N (padrão 2) reenvia SYN só para quem não
+    respondeu, pegando pacote perdido no 4G
+  - Modo root: --iface rmnet_data0 / wlan0 força o scan a sair por uma
+    interface específica (4G ou Wi-Fi)
+  - Várias portas no SYN scan: use --ports 80,443,8080,8443
+
 Novidades da v3.1:
   - Modo ROOT (SYN scan): com --root (ou escolhendo no menu), uma pré-varredura
     manda só pacotes SYN (half-open, via raw socket) e descobre quais IPs têm
@@ -104,7 +111,7 @@ import threading
 import time
 import zlib
 
-VERSION = "3.1"
+VERSION = "3.2"
 # Pasta fixa para salvar automaticamente os resultados no Android/Termux.
 # O caminho ~/storage/downloads é o atalho criado pelo termux-setup-storage.
 OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "storage", "downloads", "DROPNET-SCANNER")
@@ -752,6 +759,16 @@ def _seq_de(ip, porta, salt):
     return zlib.crc32(f"{ip}:{porta}".encode(), salt) & 0xFFFFFFFF
 
 
+def _ip_da_iface(iface):
+    import fcntl
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        r = fcntl.ioctl(s.fileno(), 0x8915, struct.pack("256s", iface.encode()[:15]))
+        return socket.inet_ntoa(r[20:24])
+    finally:
+        s.close()
+
+
 def _ip_origem():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -787,7 +804,9 @@ async def syn_prescan(args, cidrs, portas):
     """Pré-varredura SYN (half-open) com raw socket. Precisa de root."""
     rate = max(50, int(getattr(args, "rate", 1500) or 1500))
     espera = float(getattr(args, "syn_espera", 3.0) or 3.0)
-    src = _ip_origem()
+    iface = getattr(args, "iface", None)
+    src = _ip_da_iface(iface) if iface else _ip_origem()
+    passes = max(1, int(getattr(args, "syn_passes", 2) or 1))
     salt = random.getrandbits(32)
     sport = random.randint(40000, 59999)
     ssock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
@@ -796,6 +815,9 @@ async def syn_prescan(args, cidrs, portas):
         rsock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
     except OSError:
         pass
+    if iface:
+        for sk in (ssock, rsock):
+            sk.setsockopt(socket.SOL_SOCKET, 25, iface.encode() + b"\0")   # SO_BINDTODEVICE
     rsock.settimeout(0.3)
     achados = {}
     parar = threading.Event()
@@ -805,25 +827,29 @@ async def syn_prescan(args, cidrs, portas):
     enviados = 0
     t0 = time.monotonic()
     try:
-        for ip in iter_targets(cidrs, 0, False):
-            for porta in portas:
-                try:
-                    ssock.sendto(_pacote_syn(src, ip, sport, porta, _seq_de(ip, porta, salt)), (ip, 0))
-                except OSError:
-                    pass
-                enviados += 1
-            if enviados % 200 < len(portas):
-                ideal = enviados / rate
-                real = time.monotonic() - t0
-                await asyncio.sleep(max(0.0, ideal - real))
-                if UI.color:
-                    n = sum(len(v) for v in achados.values())
-                    sys.stdout.write(f"\r\033[K SYN {fmt(enviados)}/{fmt(total)} · abertas: {n}")
-                    sys.stdout.flush()
-        # espera as últimas respostas chegarem
-        fim = time.monotonic() + espera
-        while time.monotonic() < fim:
-            await asyncio.sleep(0.2)
+        for passo in range(1, passes + 1):
+            for ip in iter_targets(cidrs, 0, False):
+                ja = achados.get(ip, ())
+                for porta in portas:
+                    if porta in ja:
+                        continue            # já respondeu: não reenvia
+                    try:
+                        ssock.sendto(_pacote_syn(src, ip, sport, porta, _seq_de(ip, porta, salt)), (ip, 0))
+                    except OSError:
+                        pass
+                    enviados += 1
+                if enviados % 200 < len(portas):
+                    ideal = enviados / rate
+                    real = time.monotonic() - t0
+                    await asyncio.sleep(max(0.0, ideal - real))
+                    if UI.color:
+                        n = sum(len(v) for v in achados.values())
+                        sys.stdout.write(f"\r\033[K SYN passo {passo}/{passes} · enviados {fmt(enviados)} · abertas: {n}")
+                        sys.stdout.flush()
+            # espera as respostas desse passo chegarem
+            fim = time.monotonic() + espera
+            while time.monotonic() < fim:
+                await asyncio.sleep(0.2)
     finally:
         parar.set()
         th.join(1)
@@ -853,7 +879,8 @@ async def preparar_root(args, portas):
     cidrs = coletar_cidrs(args)
     portas = sorted(set(portas))
     print(c("1;36", f" Modo ROOT: SYN scan em {fmt(total_ips(cidrs))} IPs · portas {','.join(map(str, portas))}"
-                    f" · {args.rate} pacotes/s"))
+                    f" · {args.rate} pacotes/s · {args.syn_passes} passo(s)"
+                    + (f" · iface {args.iface}" if args.iface else "")))
     t0 = time.monotonic()
     try:
         SYN_ABERTOS = await syn_prescan(args, cidrs, portas)
@@ -2371,6 +2398,8 @@ def build_parser():
     r.add_argument("--root", action="store_true", help="modo root: pré-varredura SYN (raw socket, precisa de root); sem root cai no modo normal")
     r.add_argument("--rate", type=int, default=1500, help="pacotes SYN por segundo no modo root (padrão 1500)")
     r.add_argument("--syn-espera", type=float, default=3.0, help="segundos esperando respostas após o último SYN (padrão 3)")
+    r.add_argument("--syn-passes", type=int, default=2, help="passos do SYN scan: reenvia só p/ quem não respondeu (padrão 2)")
+    r.add_argument("--iface", default=None, help="interface de saída do SYN scan (ex.: rmnet_data0, wlan0)")
     r.add_argument("--no-color", action="store_true", help="sem cores")
 
     g2 = p.add_argument_group("gerar payload / testar hosts / perfis")
