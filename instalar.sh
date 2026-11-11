@@ -1,172 +1,196 @@
 #!/data/data/com.termux/files/usr/bin/bash
-# =====================================================================
-#  DROPNET SCANNER — instalador completo para Termux (v3.1)
-#  Rode UMA vez:   bash instalar.sh
-#  ou direto do GitHub: curl -fsSL <URL-raw-do-instalar.sh> | bash
-#  Faz tudo do guia: atualiza o Termux, instala python/git/curl/wget,
-#  libera o armazenamento, clona o repositório do GitHub, cria os
-#  comandos e já abre o scanner.
-#      dropnet          -> scanner normal (sem root)
-#      dropnet-root     -> scanner com SYN scan (precisa de root)
-#      dropnet-update   -> git pull (atualiza pelo GitHub)
-# =====================================================================
-set -u
+# DROPNET SCANNER — instalador para Termux
+# Uso: bash instalar.sh
+# Também pode ser executado por: curl -fsSL URL_RAW | bash
+
+set -Eeuo pipefail
 
 REPO_URL="${DROPNET_REPO:-https://github.com/bielsshdropnet-ai/dropnet-scanner.git}"
+DIR="$HOME/dropnet-scanner"
 ARQ="ipv4scanner.py"
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+LOG="$HOME/.dropnet_install.log"
 
-VERDE='\033[1;32m'; AMAR='\033[1;33m'; VERM='\033[1;31m'; CIAN='\033[1;36m'; RST='\033[0m'
-ok()   { printf "${VERDE} ✔ %s${RST}\n" "$*"; }
-info() { printf "${CIAN} ➜ %s${RST}\n" "$*"; }
-aviso(){ printf "${AMAR} ! %s${RST}\n" "$*"; }
-erro() { printf "${VERM} ✖ %s${RST}\n" "$*"; }
+VERDE='\033[1;32m'
+AMAR='\033[1;33m'
+VERM='\033[1;31m'
+CIAN='\033[1;36m'
+RST='\033[0m'
+
+ok()    { printf "${VERDE}[OK] %s${RST}\n" "$*"; }
+info()  { printf "${CIAN}[*] %s${RST}\n" "$*"; }
+aviso() { printf "${AMAR}[AVISO] %s${RST}\n" "$*"; }
+erro()  { printf "${VERM}[ERRO] %s${RST}\n" "$*" >&2; }
+
+falha() {
+    local rc=$?
+    erro "A instalação foi interrompida na linha ${BASH_LINENO[0]:-desconhecida} (código $rc)."
+    erro "Consulte o log completo: $LOG"
+    exit "$rc"
+}
+trap falha ERR
+
+# Registra a saída completa do instalador em um arquivo, sem esconder
+# o que está acontecendo na tela.
+mkdir -p "$HOME"
+touch "$LOG"
+exec > >(tee -a "$LOG") 2>&1
+
+executar() {
+    info "Executando: $*"
+    "$@"
+}
+
+mostrar_titulo() {
+    printf "\n${CIAN}"
+    printf '╔════════════════════════════════════════════╗\n'
+    printf '║          DROPNET SCANNER INSTALLER         ║\n'
+    printf '╚════════════════════════════════════════════╝\n'
+    printf "${RST}\n"
+}
 
 main() {
-if ! command -v pkg >/dev/null 2>&1; then
-    erro "Este instalador é para o Termux (comando 'pkg' não encontrado)."
-    exit 1
-fi
+    mostrar_titulo
 
-PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
-DIR="$HOME/dropnet-scanner"
-SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
-
-echo
-printf "${CIAN}╔══════════════════════════════════════╗\n║   DROPNET SCANNER · instalador       ║\n╚══════════════════════════════════════╝${RST}\n\n"
-
-# ---------- 1) atualizar o Termux ----------
-info "1/5  Atualizando o Termux (pode demorar um pouco)..."
-pkg update -y </dev/null && pkg upgrade -y </dev/null || aviso "Atualização com avisos. Continuando..."
-ok "Termux atualizado"
-
-# ---------- 2) dependências ----------
-info "2/5  Instalando python, git, curl, wget e root (tsu)..."
-pkg install python git curl wget -y </dev/null
-if ! command -v python >/dev/null 2>&1; then
-    erro "Falhou instalar o Python (veja o erro acima). Se for mirror, rode 'termux-change-repo' e tente de novo."
-    exit 1
-fi
-pkg install tsu termux-tools -y </dev/null || aviso "Não consegui instalar o 'tsu' (só afeta o modo root)."
-ok "Python $(python -V 2>&1 | awk '{print $2}') · git $(git --version 2>/dev/null | awk '{print $3}')"
-
-# ---------- 3) armazenamento ----------
-info "3/5  Liberando acesso ao armazenamento (onde ficam os resultados)..."
-if [ ! -d "$HOME/storage/downloads" ]; then
-    termux-setup-storage </dev/null >/dev/null 2>&1
-    aviso "Se aparecer um pedido de permissão na tela, toque em PERMITIR."
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-        [ -d "$HOME/storage/downloads" ] && break
-        sleep 1
-    done
-fi
-if [ -d "$HOME/storage/downloads" ]; then
-    mkdir -p "$HOME/storage/downloads/DROPNET-SCANNER" 2>/dev/null
-    ok "Resultados serão salvos em Download/DROPNET-SCANNER"
-else
-    aviso "Sem acesso ao armazenamento ainda. Rode 'termux-setup-storage' depois."
-fi
-
-# ---------- 4) repositório do GitHub ----------
-info "4/5  Baixando o scanner do GitHub..."
-PROV_ANTIGO=""
-if [ -d "$DIR/.git" ]; then
-    ( cd "$DIR" && git pull --ff-only </dev/null ) && ok "Repositório atualizado (git pull)" \
-        || aviso "git pull falhou (alterações locais?). Mantendo os arquivos atuais."
-else
-    if [ -d "$DIR" ]; then
-        [ -f "$DIR/providers.json" ] && { PROV_ANTIGO="$HOME/.providers_anterior.json"; cp -f "$DIR/providers.json" "$PROV_ANTIGO"; }
-        mv "$DIR" "$DIR.bak.$(date +%s)"
-        aviso "Pasta antiga (sem git) guardada como $DIR.bak.*"
+    if ! command -v pkg >/dev/null 2>&1; then
+        erro "Este instalador precisa ser executado dentro do Termux."
+        erro "O comando 'pkg' não foi encontrado."
+        exit 1
     fi
-    if git clone "$REPO_URL" "$DIR" </dev/null; then
-        ok "Repositório clonado"
+
+    if [[ ! -d "$PREFIX/bin" ]]; then
+        erro "Diretório de comandos do Termux não encontrado: $PREFIX/bin"
+        exit 1
+    fi
+
+    # 1. Atualização do Termux
+    printf "\n${CIAN}========== [1/7] ATUALIZANDO O TERMUX ==========${RST}\n"
+    executar pkg update -y
+    executar pkg upgrade -y
+    ok "Termux atualizado."
+
+    # 2. Dependências
+    printf "\n${CIAN}========== [2/7] INSTALANDO DEPENDÊNCIAS ==========${RST}\n"
+    info "Pacotes solicitados: Python, Git, cURL e Wget."
+    executar pkg install python git curl wget -y
+
+    for pacote in python git curl wget; do
+        if ! command -v "$pacote" >/dev/null 2>&1; then
+            erro "O comando '$pacote' não foi encontrado após a instalação."
+            exit 1
+        fi
+        ok "$pacote instalado: $(command -v "$pacote")"
+    done
+
+    info "Versões instaladas:"
+    python --version
+    git --version
+    curl --version | head -n 1
+    wget --version | head -n 1
+
+    # 3. Armazenamento
+    printf "\n${CIAN}========== [3/7] CONFIGURANDO ARMAZENAMENTO ==========${RST}\n"
+    if [[ ! -d "$HOME/storage/downloads" ]]; then
+        aviso "O acesso ao armazenamento pode solicitar autorização do Android."
+        executar termux-setup-storage
     else
-        aviso "Não consegui clonar o GitHub (sem internet ou repositório privado)."
-        mkdir -p "$DIR"
+        ok "Atalho do armazenamento já existe."
     fi
-fi
-mkdir -p "$DIR"
 
-if [ ! -f "$DIR/$ARQ" ]; then
-    erro "Não consegui baixar o $ARQ do GitHub (sem internet ou repositório privado)."
-    erro "Confira a internet e rode o instalador de novo."
-    exit 1
-fi
-chmod +x "$DIR/$ARQ"
-if grep -q -- "--syn-espera" "$DIR/$ARQ"; then
-    ok "Scanner com modo root ($ARQ)"
-else
-    aviso "O $ARQ do GitHub é uma versão SEM modo root. O 'dropnet' funciona normal;"
-    aviso "o 'dropnet-root' só funciona depois que você publicar a v3.1 no repositório."
-fi
+    if [[ -d "$HOME/storage/downloads" ]]; then
+        executar mkdir -p "$HOME/storage/downloads/DROPNET-SCANNER"
+        ok "Pasta de resultados: $HOME/storage/downloads/DROPNET-SCANNER"
+    else
+        aviso "A pasta Download ainda não está acessível."
+        aviso "Depois de permitir o acesso no Android, execute:"
+        aviso "termux-setup-storage"
+        aviso "mkdir -p ~/storage/downloads/DROPNET-SCANNER"
+    fi
 
-# providers.json: o do repositório; senão procura o seu; senão cria modelo
-if [ ! -f "$DIR/providers.json" ]; then
-    for cand in "$PROV_ANTIGO" "$SELF_DIR/providers.json" "$HOME/storage/downloads/providers.json" \
-                "$HOME/storage/shared/Download/providers.json" "$HOME/providers.json"; do
-        if [ -n "$cand" ] && [ -f "$cand" ]; then cp -f "$cand" "$DIR/providers.json"; ok "providers.json copiado de $cand"; break; fi
-    done
-fi
-if [ ! -f "$DIR/providers.json" ]; then
-    cat > "$DIR/providers.json" <<'PJ'
-{
-  "providers": [
-    { "name": "exemplo", "cidrs": ["192.0.2.0/24"] }
-  ]
-}
-PJ
-    aviso "providers.json NÃO encontrado. Criei um modelo de exemplo em $DIR/providers.json"
-    aviso "Troque pelo seu (mesmo formato)."
-else
-    ok "providers.json presente"
-fi
+    # 4. Repositório
+    printf "\n${CIAN}========== [4/7] BAIXANDO / ATUALIZANDO GITHUB ==========${RST}\n"
+    if [[ -d "$DIR/.git" ]]; then
+        info "Repositório existente encontrado em $DIR"
+        executar git -C "$DIR" pull --ff-only
+        ok "Repositório atualizado pelo GitHub."
+    else
+        if [[ -e "$DIR" ]]; then
+            BACKUP="${DIR}.backup.$(date +%Y%m%d-%H%M%S)"
+            executar mv "$DIR" "$BACKUP"
+            aviso "Pasta anterior guardada em: $BACKUP"
+        fi
+        executar git clone "$REPO_URL" "$DIR"
+        ok "Repositório baixado."
+    fi
 
-# ---------- 5) comandos ----------
-info "5/5  Criando os comandos dropnet, dropnet-root e dropnet-update..."
-cat > "$PREFIX/bin/dropnet" <<'L1'
+    # 5. Verificação dos arquivos
+    printf "\n${CIAN}========== [5/7] VERIFICANDO ARQUIVOS ==========${RST}\n"
+    if [[ ! -f "$DIR/$ARQ" ]]; then
+        erro "Arquivo obrigatório não encontrado: $DIR/$ARQ"
+        erro "Confira se o repositório contém $ARQ e tente novamente."
+        exit 1
+    fi
+    ok "$ARQ encontrado."
+
+    if [[ ! -f "$DIR/providers.json" ]]; then
+        erro "Arquivo providers.json não encontrado em $DIR."
+        erro "O guia do DROPNET espera esse arquivo no repositório."
+        exit 1
+    fi
+    ok "providers.json encontrado."
+
+    info "Verificando a sintaxe do arquivo Python..."
+    executar python -m py_compile "$DIR/$ARQ"
+    ok "Sintaxe Python verificada."
+
+    # 6. Comandos rápidos
+    printf "\n${CIAN}========== [6/7] CRIANDO COMANDOS ==========${RST}\n"
+
+    info "Criando comando dropnet..."
+    cat > "$PREFIX/bin/dropnet" <<'DROP'
 #!/data/data/com.termux/files/usr/bin/bash
-termux-wake-lock 2>/dev/null
+termux-wake-lock 2>/dev/null || true
 cd "$HOME/dropnet-scanner" || exit 1
 exec python ipv4scanner.py "$@"
-L1
+DROP
+    chmod 755 "$PREFIX/bin/dropnet"
+    ok "Comando dropnet criado."
 
-cat > "$PREFIX/bin/dropnet-root" <<'L2'
+    info "Criando comando dropnet-update..."
+    cat > "$PREFIX/bin/dropnet-update" <<'UPDATE'
 #!/data/data/com.termux/files/usr/bin/bash
-# Roda o scanner como root (SYN scan). Precisa de aparelho com root.
-if ! command -v su >/dev/null 2>&1; then
-    echo "su não encontrado: aparelho sem root. Use o comando 'dropnet'."
-    exit 1
-fi
-termux-wake-lock 2>/dev/null
-CMD="export HOME='$HOME' PREFIX='$PREFIX' PATH='$PATH' LD_LIBRARY_PATH='$PREFIX/lib' TERM='${TERM:-xterm-256color}'; cd '$HOME/dropnet-scanner' && python ipv4scanner.py --root"
-for a in "$@"; do CMD+=" $(printf '%q' "$a")"; done
-exec su -c "$CMD"
-L2
-
-cat > "$PREFIX/bin/dropnet-update" <<'L3'
-#!/data/data/com.termux/files/usr/bin/bash
+set -e
 cd "$HOME/dropnet-scanner" || exit 1
-git pull --ff-only && echo "Atualizado."
-L3
-chmod +x "$PREFIX/bin/dropnet" "$PREFIX/bin/dropnet-root" "$PREFIX/bin/dropnet-update"
-ok "Comandos criados"
+echo "[*] Buscando atualizações no GitHub..."
+git pull --ff-only
+echo "[*] Verificando o arquivo Python..."
+python -m py_compile ipv4scanner.py
+echo "[OK] DROPNET SCANNER atualizado."
+UPDATE
+    chmod 755 "$PREFIX/bin/dropnet-update"
+    ok "Comando dropnet-update criado."
 
-echo
-printf "${VERDE}══════════════════════════════════════\n  INSTALAÇÃO CONCLUÍDA\n══════════════════════════════════════${RST}\n"
-echo "  dropnet          -> scanner normal (sem root)"
-echo "  dropnet-root     -> scanner com SYN scan (root)"
-echo "  dropnet-update   -> atualiza pelo GitHub (git pull)"
-echo "  Resultados:      Download/DROPNET-SCANNER (salvos sozinhos)"
-echo
+    # 7. Finalização
+    printf "\n${CIAN}========== [7/7] FINALIZANDO ==========${RST}\n"
+    ok "Instalação concluída."
+    printf "\nComandos disponíveis:\n"
+    printf "  dropnet          - abrir o scanner\n"
+    printf "  dropnet-update   - atualizar pelo GitHub\n"
+    printf "\nPasta de resultados esperada:\n"
+    printf "  Download/DROPNET-SCANNER\n"
+    printf "\nLog completo da instalação:\n  %s\n" "$LOG"
 
-if { true </dev/tty; } 2>/dev/null; then
-    printf "${CIAN}Abrir agora? [Enter = normal · r = root · n = sair]: ${RST}"
-    read -r R </dev/tty
-    case "${R,,}" in
-        n) exit 0 ;;
-        r) exec dropnet-root ;;
-        *) exec dropnet ;;
-    esac
-fi
+    printf "\n${AMAR}IMPORTANTE:${RST} o instalador cria a pasta de resultados, mas o salvamento\n"
+    printf "automático depende de o ipv4scanner.py gravar os arquivos nesse caminho.\n"
+
+    # Permite abrir o scanner mesmo quando o instalador foi chamado por curl | bash.
+    if { true </dev/tty; } 2>/dev/null; then
+        printf "\n${CIAN}Abrir o scanner agora? [Enter = sim / n = não]: ${RST}"
+        read -r RESPOSTA </dev/tty || RESPOSTA="n"
+        if [[ "${RESPOSTA,,}" != "n" ]]; then
+            exec "$PREFIX/bin/dropnet"
+        fi
+    fi
 }
+
 main "$@"
