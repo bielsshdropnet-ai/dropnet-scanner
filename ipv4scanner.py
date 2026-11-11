@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DROPNET SCANNER v3.0
+DROPNET SCANNER v3.2
 Varre faixas de CDNs/provedores e separa os IPs por porta (80 / 443).
 
 Novidades da v3.2:
@@ -111,6 +111,11 @@ import threading
 import time
 import zlib
 
+#
+# DROPNET SCANNER
+# (c) 2026 BIEL_SSH - Todos os direitos reservados.
+# Uso, copia ou redistribuicao sem autorizacao sao proibidos. Ver LICENSE.
+#
 VERSION = "3.2"
 # Pasta fixa para salvar automaticamente os resultados no Android/Termux.
 # O caminho ~/storage/downloads é o atalho criado pelo termux-setup-storage.
@@ -459,6 +464,7 @@ def banner():
     print(c("1;36", "║") + c("1;97", "D R O P N E T".center(w)) + c("1;36", "║"))
     print(c("1;36", "║") + c("36", f"S C A N N E R   v{VERSION}".center(w)) + c("1;36", "║"))
     print(c("1;36", "╚" + "═" * w + "╝"))
+    print(c("2", "© 2026 BIEL_SSH · todos os direitos reservados".center(w)))
 
 
 def line(ch="─", color="2"):
@@ -778,7 +784,7 @@ def _ip_origem():
         s.close()
 
 
-def _receptor_syn(rsock, parar, achados, sport, salt):
+def _receptor_syn(rsock, parar, achados, lock, sport, salt):
     while not parar.is_set():
         try:
             b = rsock.recv(2048)
@@ -797,7 +803,8 @@ def _receptor_syn(rsock, parar, achados, sport, salt):
             continue
         if ack != (_seq_de(ip, tsp, salt) + 1) & 0xFFFFFFFF:
             continue
-        achados.setdefault(ip, set()).add(tsp)
+        with lock:
+            achados.setdefault(ip, set()).add(tsp)
 
 
 async def syn_prescan(args, cidrs, portas):
@@ -820,8 +827,9 @@ async def syn_prescan(args, cidrs, portas):
             sk.setsockopt(socket.SOL_SOCKET, 25, iface.encode() + b"\0")   # SO_BINDTODEVICE
     rsock.settimeout(0.3)
     achados = {}
+    lock = threading.Lock()
     parar = threading.Event()
-    th = threading.Thread(target=_receptor_syn, args=(rsock, parar, achados, sport, salt), daemon=True)
+    th = threading.Thread(target=_receptor_syn, args=(rsock, parar, achados, lock, sport, salt), daemon=True)
     th.start()
     total = total_ips(cidrs) * len(portas)
     enviados = 0
@@ -829,7 +837,8 @@ async def syn_prescan(args, cidrs, portas):
     try:
         for passo in range(1, passes + 1):
             for ip in iter_targets(cidrs, 0, False):
-                ja = achados.get(ip, ())
+                with lock:
+                    ja = set(achados.get(ip, ()))
                 for porta in portas:
                     if porta in ja:
                         continue            # já respondeu: não reenvia
@@ -843,7 +852,8 @@ async def syn_prescan(args, cidrs, portas):
                     real = time.monotonic() - t0
                     await asyncio.sleep(max(0.0, ideal - real))
                     if UI.color:
-                        n = sum(len(v) for v in achados.values())
+                        with lock:
+                            n = sum(len(v) for v in achados.values())
                         sys.stdout.write(f"\r\033[K SYN passo {passo}/{passes} · enviados {fmt(enviados)} · abertas: {n}")
                         sys.stdout.flush()
             # espera as respostas desse passo chegarem
@@ -857,7 +867,8 @@ async def syn_prescan(args, cidrs, portas):
         rsock.close()
         if UI.color:
             sys.stdout.write("\r\033[K")
-    return achados
+    with lock:
+        return {ip: set(portas) for ip, portas in achados.items()}
 
 
 async def preparar_root(args, portas):
@@ -1717,17 +1728,39 @@ async def testar_hosts(args):
     print()
     sem = asyncio.Semaphore(15)
     ok = []
+    done = 0
+    start = time.monotonic()
+    last_draw = 0.0
+
+    def redraw(force=False):
+        nonlocal last_draw
+        now = time.monotonic()
+        if not UI.color:
+            return
+        if force or now - last_draw > 0.15:
+            sys.stdout.write("\r\033[K" + progress_line(done, len(hosts), len(ok), start))
+            sys.stdout.flush()
+            last_draw = now
 
     async def um(host):
+        nonlocal done
         a2 = copy.copy(args)
         a2.host, a2.sni = host, host
         async with sem:
             res = await testar_um_payload(ip, porta, args.payload, a2, ssl_ctx, ranges, use_tls)
+        done += 1
         if res:
             ok.append((host, res))
-            print(f" {c('1;32', '✔')} {c('1', host.ljust(28))} {c('32', res[0][:30])}  {c('2', f'{res[1]}ms')}")
+            txt = f" {c('1;32', '✔')} {c('1', host.ljust(28))} {c('32', res[0][:30])}  {c('2', f'{res[1]}ms')}"
+            if UI.color:
+                sys.stdout.write("\r\033[K" + txt + "\n")
+            else:
+                print(txt, flush=True)
+        redraw()
 
     await asyncio.gather(*(um(h) for h in hosts))
+    if UI.color:
+        sys.stdout.write("\r\033[K" + progress_line(done, len(hosts), len(ok), start) + "\n")
     ok.sort(key=lambda x: x[1][1])
     print()
     line("═", "1;36")
@@ -2440,55 +2473,4 @@ def main():
     if args.gerar_payload:
         args.ip = args.gerar_payload
         try:
-            asyncio.run(gerar_payload(args))
-        except KeyboardInterrupt:
-            pass
-        return
-
-    if args.testar_hosts:
-        if not args.ip:
-            sys.exit("--testar-hosts precisa de --ip IP.")
-        try:
-            asyncio.run(testar_hosts(args))
-        except KeyboardInterrupt:
-            pass
-        return
-
-    if args.usar_perfil:
-        perfil_carregar(args, args.usar_perfil)
-
-    if not (args.cidr or args.cidr_file or args.provider or args.hosts):
-        try:
-            while True:
-                a = interactive(args)
-                if a is None:
-                    break
-                try:
-                    asyncio.run(run_combo(a) if a.modo else run(a))
-                except KeyboardInterrupt:
-                    pass
-                try:
-                    r = input(c("2", " Enter = voltar ao menu  ·  q = sair: ")).strip().lower()
-                except EOFError:
-                    break
-                if r in ("q", "sair", "0"):
-                    break
-        except KeyboardInterrupt:
-            pass
-        print(c("2", "\n Até mais.\n"))
-        return
-
-    try:
-        if args.modo:
-            aplicar_padroes_combo(args)
-            args.port_ssl, args.port_ssh = 443, 80
-            args.tentativas = max(1, args.tentativas)
-            asyncio.run(run_combo(args))
-        else:
-            asyncio.run(run(args))
-    except KeyboardInterrupt:
-        pass
-
-
-if __name__ == "__main__":
-    main()
+            asyncio.run(gerar_payload(args
