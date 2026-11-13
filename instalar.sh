@@ -84,7 +84,7 @@ done
 EOF
 
 chmod +x "$LAUNCHER"
-ok "Comando criado: dropnet-scanner"
+ok "Comando criado: dropnet"
 
 echo
 echo "=========================================="
