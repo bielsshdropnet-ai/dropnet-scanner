@@ -1,0 +1,17 @@
+DROPNET SCANNER 3.0 — pacote com menu revisado
+
+Instalação:
+1. Extraia o ZIP no Termux.
+2. Entre na pasta dropnet-scanner-main.
+3. Execute: bash instalar.sh
+
+Bateria e operadora:
+- Instale o aplicativo Termux:API (da mesma origem de instalação do Termux).
+- O instalador instala o pacote de linha de comando termux-api.
+- Abra as configurações do Android e conceda ao Termux:API as permissões necessárias
+  para informações do telefone, quando solicitadas.
+- Se o Android ou a versão do Termux:API bloquear essas informações, o menu mostrará
+  "indisponível" ou "não identificada"; isso não é um erro do scanner.
+
+O scanner original (ipv4scanner.py) e a base de provedores foram preservados.
+A seleção de provedor continua informativa; ainda não foi ligada à lógica do scanner.
