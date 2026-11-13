@@ -65,7 +65,7 @@ python -c "import os; p=os.path.expanduser('~/storage/downloads/DROPNET-SCANNER/
 ok "Salvamento testado"
 
 # 7. Criar comando de inicialização
-LAUNCHER="$PREFIX/bin/dropnet-scanner"
+LAUNCHER="$PREFIX/bin/dropnet"
 
 cat > "$LAUNCHER" << 'EOF'
 #!/data/data/com.termux/files/usr/bin/bash
