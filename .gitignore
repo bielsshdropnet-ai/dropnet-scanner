@@ -1,0 +1,11 @@
+# Arquivos temporários do Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Arquivos temporários
+*.tmp
+*.log
+
+# Configurações locais
+.env
