@@ -1,0 +1,7 @@
+DROPNET SCANNER V8 — atualizador completo
+
+Instalação inicial: extraia o ZIP, entre na pasta dropnet-scanner-main e execute bash instalar.sh.
+
+Atualização: no menu, escolha 3. O programa consulta o commit da branch main do repositório GitHub configurado. Se houver novidade, escolha S para baixar e substituir o conjunto completo de arquivos do projeto. Um backup da pasta anterior é mantido em ~/dropnet-scanner.backup.
+
+Os resultados em ~/storage/downloads/DROPNET-SCANNER ficam fora da pasta do programa e não são substituídos pelo atualizador.
