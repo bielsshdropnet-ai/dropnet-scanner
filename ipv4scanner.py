@@ -3,6 +3,17 @@
 DROPNET SCANNER v3.0
 Varre faixas de CDNs/provedores e separa os IPs por porta (80 / 443).
 
+Novidades da v3.1:
+  - Respostas em sequência na mesma conexão (ex.: 403 -> 101 -> 200): o scanner
+    agora lê todas as respostas, não só a primeira linha. Se QUALQUER uma bater
+    com o status esperado (ex.: 101), o IP conta como funcionou e mostra a
+    sequência (403→101→200). Tempo de espera pelas próximas respostas:
+    --espera-extra (padrão 1.0s)
+  - "Testar proxies existentes" (opção 2) reorganizado: etapas claras, vários
+    Hosts e vários SNIs (cada Host é testado com cada SNI), resultado agrupado
+    por IP e arquivo com host/sni. Corrigido erro ao escolher "Gerar" payload
+    dentro dessa opção
+
 Novidades da v3.0:
   - Vários Host/SNI em rotate: ao perguntar Host ou SNI no menu, agora dá
     pra adicionar mais de um ("Adicionar outro?"). Com 2+ valores, um
@@ -91,7 +102,7 @@ import sys
 import textwrap
 import time
 
-VERSION = "3.0"
+VERSION = "3.1"
 # Pasta fixa para salvar automaticamente os resultados no Android/Termux.
 # O caminho ~/storage/downloads é o atalho criado pelo termux-setup-storage.
 OUTPUT_DIR = os.path.join(os.path.expanduser("~"), "storage", "downloads", "DROPNET-SCANNER")
@@ -650,7 +661,7 @@ def pedir_host_sni(args, rotulo, campo):
         itens.append(pedir_texto(rotulo))
     if len(itens) > 1:
         setattr(args, pool_attr, itens)
-        print(c("32", f" {len(itens)}  {rotulo} - Random automáticoem."))
+        print(c("32", f" {len(itens)} {rotulo}(s) - cada Host será testado com cada SNI."))
     else:
         setattr(args, pool_attr, None)
     return itens[0]
@@ -673,6 +684,59 @@ def parse_status_spec(spec):
 
 def status_ok(code, ranges):
     return any(a <= code <= b for a, b in ranges)
+
+
+RE_HTTP_STATUS = re.compile(rb"(?im)^HTTP/\d(?:\.\d)?[ \t]+(\d{3})(?:[ \t]+([^\r\n]*))?")
+
+
+def extrair_respostas(dados):
+    """Todas as respostas HTTP achadas nos bytes recebidos: [(codigo, 'HTTP 101 Motivo')]."""
+    out = []
+    for cod, motivo in RE_HTTP_STATUS.findall(bytes(dados)):
+        m = motivo.decode("latin-1", "replace").strip()
+        out.append((int(cod), f"HTTP {int(cod)}" + (f" {m}" if m else "")))
+    return out
+
+
+def resumo_respostas(respostas):
+    """Uma resposta -> a linha de status; várias -> sequência (ex.: 403→101→200)."""
+    if len(respostas) == 1:
+        return respostas[0][1]
+    # Junta repetidas seguidas: 403,403,101,200,200 -> 403×2→101→200×2
+    partes = []
+    for cod, _ in respostas:
+        if partes and partes[-1][0] == cod:
+            partes[-1][1] += 1
+        else:
+            partes.append([cod, 1])
+    return "→".join(str(cod) + (f"×{n}" if n > 1 else "") for cod, n in partes)
+
+
+async def ler_respostas_http(r, args, ranges, inicial=b""):
+    """Lê as respostas da conexão (uma ou várias em sequência, como 403 -> 101 -> 200).
+    Espera --espera-extra segundos por mais respostas; depois que um status aceito
+    aparece, ainda espera um pouco (até 0.6s) para pegar o que vem depois dele
+    (ex.: 403 403 101 200 200). Retorna (bytes_recebidos, [(codigo, linha)])."""
+    buf = bytearray(inicial)
+    extra = max(0.2, float(getattr(args, "espera_extra", 1.0) or 1.0))
+    curta = min(extra, 0.6)
+    achou = bool(buf) and any(status_ok(cod, ranges) for cod, _ in extrair_respostas(buf))
+    espera = curta if achou else (extra if buf else args.timeout)
+    while len(buf) < 262144:
+        try:
+            bloco = await asyncio.wait_for(r.read(65536), espera)
+        except asyncio.TimeoutError:
+            break
+        if not bloco:
+            break
+        buf.extend(bloco)
+        ini = bytes(buf).lstrip()
+        if len(ini) >= 4 and ini[:4].upper() != b"HTTP":
+            break   # não é HTTP (ex.: banner SSH): não adianta esperar mais
+        if not achou and any(status_ok(cod, ranges) for cod, _ in extrair_respostas(buf)):
+            achou = True
+        espera = curta if achou else extra
+    return bytes(buf), extrair_respostas(buf)
 
 
 async def open_conn(target, args, ssl_ctx, port=None, use_tls=None, host_sni=None):
@@ -748,16 +812,20 @@ async def probe_http(target, args, ssl_ctx, ranges, port=None, use_tls=None, tri
             conectou = True
             w.write(payload)
             await w.drain()
-            raw = await asyncio.wait_for(r.readline(), args.timeout)
-            status_line = raw.decode("latin-1", "replace").strip()
-            m = re.match(r"HTTP/\d(?:\.\d)?\s+(\d{3})", status_line)
-            if not m:
+            # Lê TODAS as respostas da conexão (ex.: 403 -> 101 -> 200); basta
+            # uma delas bater com o status esperado.
+            buf, respostas = await ler_respostas_http(r, args, ranges)
+            if not buf:
+                SEEN["conectou e não respondeu"] += 1
+                continue
+            if not respostas:
                 SEEN["resposta não-HTTP"] += 1
                 if args.debug:
-                    print(f"[--] {target}:{port}: sem status HTTP: {status_line[:60]!r}", flush=True)
+                    print(f"[--] {target}:{port}: sem status HTTP: {buf[:60]!r}", flush=True)
                 continue
-            if not status_ok(int(m.group(1)), ranges):
-                SEEN[m.group(1)] += 1
+            status_line = resumo_respostas(respostas)
+            if not any(status_ok(cod, ranges) for cod, _ in respostas):
+                SEEN[status_line] += 1
                 if args.debug:
                     print(f"[--] {target}:{port}: respondeu {status_line[:60]!r} (fora do esperado)", flush=True)
                 continue
@@ -880,7 +948,7 @@ async def run(args):
                 extra = c("2", " " + "/".join(codes))
             txt = f" {c('1', ip.ljust(16))}{cells}{extra}  {c('2', f'{ms}ms')}"
         else:
-            txt = f" {c('1;32', '✔')} {c('1', ip.ljust(15))} {c('32', info[:20])}  {c('2', f'{ms}ms')}"
+            txt = f" {c('1;32', '✔')} {c('1', ip.ljust(15))} {c('32', info[:28])}  {c('2', f'{ms}ms')}"
         if UI.color:
             sys.stdout.write("\r\033[K" + txt + "\n")
         else:
@@ -1608,15 +1676,20 @@ async def probe_combo(target, args, ssl_ctx, ranges, modo, porta, host_sni=None)
             # Host do SNI, 2ª com o Host real). A resposta das partes
             # anteriores é descartada; vale a da última.
             await enviar_payload_partes(r, w, payload, args)
-            raw = await asyncio.wait_for(r.readline(), args.timeout)
-            linha = raw.decode("latin-1", "replace").strip()
+            # Lê todas as respostas da conexão (ex.: 403 -> 101 -> 200): se
+            # qualquer uma bater com o status esperado, o IP funcionou.
+            buf, respostas = await ler_respostas_http(r, args, ranges)
             ms = int((time.monotonic() - t0) * 1000)
-            if modo == "ssh" and linha.startswith("SSH-"):
-                return linha[:40], ms
-            m = re.match(r"HTTP/\d(?:\.\d)?\s+(\d{3})", linha)
-            if m and status_ok(int(m.group(1)), ranges):
-                return linha, ms
-            COMBO_SEEN[f"{chave} respondeu {m.group(1) if m else 'não-HTTP'}"] += 1
+            if modo == "ssh" and buf.startswith(b"SSH-"):
+                return buf.split(b"\n", 1)[0].decode("latin-1", "replace").strip()[:40], ms
+            if not buf:
+                COMBO_SEEN[f"{chave} conectou e não respondeu"] += 1
+            elif not respostas:
+                COMBO_SEEN[f"{chave} respondeu não-HTTP"] += 1
+            elif any(status_ok(cod, ranges) for cod, _ in respostas):
+                return resumo_respostas(respostas), ms
+            else:
+                COMBO_SEEN[f"{chave} respondeu {resumo_respostas(respostas)}"] += 1
         except Exception:
             COMBO_SEEN[f"{chave} conectou e não respondeu"] += 1
         finally:
@@ -1684,7 +1757,7 @@ async def run_combo(args):
         hs = host if host == sni else f"{host} / SNI {sni}"
         txt = (f" {c('1;32', '✔')} {c('1', ip.ljust(15))} "
                f"{c('1;36', f'{modo}:{porta}'.ljust(9))} {c('35', hs[:28].ljust(28))} "
-               f"{c('32', info[:20])}  {c('2', f'{ms}ms')}")
+               f"{c('32', info[:28])}  {c('2', f'{ms}ms')}")
         if UI.color:
             sys.stdout.write("\r\033[K" + txt + "\n")
         else:
@@ -1954,17 +2027,38 @@ def ler_lista_proxies(texto):
     return itens
 
 
-async def testar_proxies_existentes(args):
-    """Testa endpoints fornecidos pelo usuário, sem descobrir ou varrer terceiros."""
+def pedir_lista(rotulo, padrao):
+    """Pede um ou vários valores (um por linha, ou separados por vírgula/espaço).
+    Enter em linha vazia termina; Enter logo de cara usa o padrão."""
+    print(c("2", f" Digite um {rotulo} por linha (pode colar vários)."))
+    print(c("2", f" Enter em linha vazia termina · Enter direto = {padrao}"))
+    itens = []
+    while True:
+        try:
+            v = input(c("1;36", " ❯ ") + f"{rotulo}: ").strip()
+        except EOFError:
+            break
+        if not v:
+            break
+        for parte in re.split(r"[,\s;]+", v):
+            if parte and parte not in itens:
+                itens.append(parte)
+    itens = itens or [padrao]
+    print(c("32", f" ✔ {len(itens)} {rotulo}(s): ") + ", ".join(itens[:4]) + (" ..." if len(itens) > 4 else ""))
+    return itens
+
+
+def configurar_teste_proxies(args):
+    """Parte interativa da opção 2 (roda fora do asyncio, assim o assistente de
+    payload — inclusive o 'Gerar' — funciona). Devolve a configuração ou None."""
     print(c("1", "\n TESTAR PROXIES EXISTENTES"))
-    print(c("1;36", " ETAPA 1 · INFORMAR OS IPs"))
-    print(c("2", "Cole os IPs que você deseja testar. Pressione ENTER em uma linha vazia para concluir."))
-    print(c("2", "Formato A — um IP por linha (o mesmo IP será usado como fachada e destino):"))
-    print(c("36", "  192.0.2.10"))
-    print(c("2", "Formato B — fachada seguida dos destinos, separados por #:"))
-    print(c("36", "  192.0.2.10#198.51.100.20#198.51.100.30"))
-    print(c("2", "No formato B, o primeiro IP é a fachada (Host/SNI); os demais são destinos testados."))
-    print(c("2", "Use somente IPs/proxies que você administra ou tem autorização para testar."))
+
+    etapa("ETAPA 1 · IPs")
+    print(c("2", " Um IP por linha, ou FACHADA#DESTINO1#DESTINO2..."))
+    print(c("36", "   192.0.2.10"))
+    print(c("36", "   192.0.2.10#198.51.100.20#198.51.100.30"))
+    print(c("2", " Fachada = IP do Host/SNI · destinos = onde conecta."))
+    print(c("2", " Enter em linha vazia termina."))
     linhas = []
     while True:
         try:
@@ -1978,63 +2072,99 @@ async def testar_proxies_existentes(args):
         itens = ler_lista_proxies("\n".join(linhas))
     except ValueError as exc:
         print(c("31", f" {exc}"))
-        return
+        return None
     if not itens:
         print(c("33", " Nenhum IP informado."))
-        return
+        return None
+    print(c("32", f" ✔ {len(itens)} entrada(s)"))
 
-    print(c("1;36", "\n ETAPA 2 · ESCOLHER A PORTA"))
-    print(c("2", "443 = HTTPS/TLS (usa SNI); 80 = HTTP (sem SNI)."))
-    print(c("2", "A opção 3 testa cada destino nas duas portas."))
-    print(" 1) 443 (TLS)   2) 80 (HTTP)   3) 80 + 443")
-    esc = escolher("Portas", ("1", "2", "3"), "3")
+    etapa("ETAPA 2 · Porta")
+    opcao("1", "443".ljust(8), "TLS · usa SNI")
+    opcao("2", "80".ljust(8), "HTTP · sem SNI")
+    opcao("3", "80 + 443".ljust(8), "as duas")
+    line()
+    esc = escolher("Porta", ("1", "2", "3"), "3")
     portas = {"1": [443], "2": [80], "3": [80, 443]}[esc]
 
-    print(c("1;36", "\n ETAPA 3 · ESCOLHER O TIPO DE TESTE"))
-    print(c("2", "Payload HTTP: envia uma requisição e analisa o código da resposta."))
-    print(c("2", "Somente TCP: verifica apenas se a conexão com a porta abre; não envia payload."))
-    print(" 1) Testar com Payload HTTP   2) Somente conexão TCP")
-    usar_payload = escolher("Tipo de teste", ("1", "2"), "1") == "1"
+    etapa("ETAPA 3 · Tipo de teste")
+    opcao("1", "Payload HTTP".ljust(13), "manda a requisição e lê o status")
+    opcao("2", "Só TCP".ljust(13), "só vê se a porta abre")
+    line()
+    usar_payload = escolher("Tipo", ("1", "2"), "1") == "1"
 
     host_padrao = itens[0][0]
+    hosts, snis = [host_padrao], [host_padrao]
+    payload, status = DEFAULT_PAYLOAD, "101;200"
+    espera_extra = getattr(args, "espera_extra", 1.0)
     if usar_payload:
-        print(c("1;36", "\n ETAPA 4 · INFORMAR HOST E SNI"))
-        print(c("2", "HOST é o domínio que vai no cabeçalho HTTP: Host: exemplo.com"))
-        print(c("2", "SNI é o nome enviado no handshake TLS quando a porta 443 é testada."))
-        print(c("2", "HOST e SNI podem ser diferentes. O IP de destino continua sendo o IP informado na lista."))
-        host_header = ask("HOST (domínio do cabeçalho HTTP)", host_padrao)
+        etapa("ETAPA 4 · Hosts e SNIs")
+        print(c("2", " Host = valor do cabeçalho  Host: ..."))
+        print(c("2", " SNI  = nome do handshake TLS (só na 443)"))
+        print(c("2", " Cada Host é testado com cada SNI."))
+        print()
+        hosts = pedir_lista("Host", host_padrao)
         if 443 in portas:
-            sni_val = ask("SNI (TLS; pressione Enter para repetir o HOST)", host_header)
+            print()
+            snis = pedir_lista("SNI", hosts[0])
         else:
-            sni_val = host_header
-            print(c("2", "Somente porta 80: SNI não será usado."))
-    else:
-        # O teste TCP não envia cabeçalho HTTP nem realiza validação de HOST/SNI.
-        host_header = sni_val = host_padrao
+            snis = [hosts[0]]
+            print(c("2", " Só porta 80: SNI não é usado."))
 
-    args.timeout = ask_num("Timeout por teste (segundos)", 4, float)
+        etapa("ETAPA 5 · Status aceito")
+        print(c("2", " Códigos que contam como sucesso. Ex.: 101  ·  101;200  ·  200;301-302"))
+        print(c("2", " Se a conexão responde 403 → 101 → 200, basta um bater."))
+        status = ask("Status de sucesso", "101")
+        parse_status_spec(status)
+
+        etapa("ETAPA 6 · Payload")
+        print(c("2", " O mesmo payload vale para todas as portas escolhidas."))
+        base = copy.copy(args)
+        base.host, base.sni = hosts[0], snis[0]
+        payload = pedir_payload("Payload 80" if portas == [80] else "Payload 443", base)
+
+    etapa("AJUSTES")
+    timeout = ask_num("Timeout por teste (s)", 4, float)
     if usar_payload:
-        print(c("1;36", "\n ETAPA 5 · CONFIGURAR O PAYLOAD"))
-        print(c("2", "Escolha um modelo pronto, cole um payload manual ou gere variações."))
-        print(c("2", "Nos modelos, o token [host] será substituído pelo HOST informado acima."))
-        print(c("2", "[crlf] e [lf] representam quebras de linha; use o formato exigido pelo servidor."))
-        args.payload = pedir_payload("Payload", args)
-        print(c("1;36", "\n ETAPA 6 · AJUSTAR A RESPOSTA ACEITA"))
-        print(c("2", "Informe quais códigos HTTP o scanner deve contar como resultado aprovado."))
-        print(c("2", "Exemplo: 101;200 ou 200;301-302. 403/404 também podem indicar bloqueio ou página inexistente."))
-        args.status = ask("Códigos HTTP considerados sucesso", "101;200")
-        ranges = parse_status_spec(args.status)
-    else:
-        args.payload = DEFAULT_PAYLOAD
-        args.status = "101;200"
-        ranges = parse_status_spec(args.status)
+        espera_extra = ask_num("Espera por respostas seguidas (s)", espera_extra, float)
+
+    return dict(args=args, itens=itens, portas=portas, usar_payload=usar_payload,
+                hosts=hosts, snis=snis, payload=payload, status=status,
+                timeout=timeout, espera_extra=espera_extra)
+
+
+async def testar_proxies_existentes(cfg):
+    """Testa endpoints fornecidos pelo usuário, sem descobrir ou varrer terceiros.
+    Cada IP/porta é testado com todas as combinações Host x SNI."""
+    args = copy.copy(cfg["args"])
+    args.timeout, args.espera_extra = cfg["timeout"], cfg["espera_extra"]
+    args.payload, args.status = cfg["payload"], cfg["status"]
+    args._hosts_pool = args._sni_pool = None
+    itens, portas, usar_payload = cfg["itens"], cfg["portas"], cfg["usar_payload"]
+    ranges = parse_status_spec(args.status)
+
+    pares_porta = {}
+    for porta in portas:
+        if porta == 443:
+            pares = [(h, s) for h in cfg["hosts"] for s in cfg["snis"]]
+        else:
+            pares = [(h, h) for h in cfg["hosts"]]
+        pares_porta[porta] = list(dict.fromkeys(pares))
+    testes = [(f, d, p, h, s) for f, d in itens for p in portas for h, s in pares_porta[p]]
 
     sem = asyncio.Semaphore(30)
-    resultados = []
-    async def um(fachada, destino, porta):
+    resultados = []      # (fachada, destino, porta, host, sni, ms, detalhe)
+    falhas = Counter()
+
+    def mostrar(ok, fachada, destino, porta, host, sni, ms, detalhe):
+        simbolo, cor = ("✔", "1;32") if ok else ("·", "33")
+        hs = host if host == sni or porta == 80 else f"{host} · SNI {sni}"
+        print(f" {c(cor, simbolo)} {fachada}#{destino}  :{porta}  {ms}ms", flush=True)
+        print(c("2", f"     {hs}  →  ") + c(cor, detalhe), flush=True)
+
+    async def um(fachada, destino, porta, host, sni):
         tls = porta == 443
         a2 = copy.copy(args)
-        a2.host, a2.sni = host_header, sni_val
+        a2.host, a2.sni = host, sni
         t0 = time.monotonic()
         w = None
         try:
@@ -2042,71 +2172,68 @@ async def testar_proxies_existentes(args):
                 ctx = make_ssl_ctx(a2) if tls else None
                 r, w = await asyncio.wait_for(
                     asyncio.open_connection(destino, porta, ssl=ctx,
-                        server_hostname=sni_val if tls else None), a2.timeout * 2 if tls else a2.timeout)
-                if usar_payload:
-                    payload = build_payload(a2, destino, a2.payload, (host_header, sni_val))
-                    recebidos = bytearray()
-                    await enviar_payload_partes(r, w, payload, a2, capturar=recebidos)
-
-                    # Registra várias respostas HTTP recebidas na mesma conexão.
-                    limite = time.monotonic() + max(2.0, min(a2.timeout, 4.0))
-                    while len(recebidos) < 262144:
-                        restante = limite - time.monotonic()
-                        if restante <= 0:
-                            break
-                        try:
-                            bloco = await asyncio.wait_for(r.read(65536), restante)
-                        except asyncio.TimeoutError:
-                            break
-                        if not bloco:
-                            break
-                        recebidos.extend(bloco)
-
-                    linhas_http = re.findall(
-                        rb"(?im)^HTTP/\d(?:\.\d)?[ \t]+(\d{3})(?:[ \t]+([^\r\n]*))?",
-                        bytes(recebidos),
-                    )
-                    respostas = []
-                    for codigo_raw, motivo_raw in linhas_http:
-                        codigo = int(codigo_raw)
-                        motivo = motivo_raw.decode("latin-1", "replace").strip()
-                        linha_status = f"HTTP {codigo}" + (f" {motivo}" if motivo else "")
-                        respostas.append((codigo, linha_status))
-
-                    ok = any(status_ok(codigo, ranges) for codigo, _ in respostas)
-                    detalhe = " | ".join(linha for _, linha in respostas) or "sem resposta HTTP"
-                else:
-                    ok, detalhe = True, "porta TCP aberta"
-                    respostas = []
+                        server_hostname=sni if tls else None), a2.timeout * 2 if tls else a2.timeout)
+                if not usar_payload:
+                    ms = int((time.monotonic() - t0) * 1000)
+                    resultados.append((fachada, destino, porta, host, sni, ms, "porta TCP aberta"))
+                    mostrar(True, fachada, destino, porta, host, sni, ms, "porta TCP aberta")
+                    return
+                payload = build_payload(a2, destino, a2.payload, (host, sni))
+                recebidos = bytearray()
+                await enviar_payload_partes(r, w, payload, a2, capturar=recebidos)
+                # Lê as respostas em sequência (ex.: 403 -> 101 -> 200).
+                _, respostas = await ler_respostas_http(r, a2, ranges, inicial=bytes(recebidos))
                 ms = int((time.monotonic() - t0) * 1000)
-
-                if usar_payload and respostas:
-                    print(f"\n {fachada}#{destino}  porta {porta}  {ms}ms", flush=True)
-                    for codigo, linha_status in respostas:
-                        aceito = status_ok(codigo, ranges)
-                        simbolo = "✔" if aceito else "·"
-                        cor = "1;32" if aceito else "33"
-                        print(f"   {c(cor, simbolo)} {linha_status}", flush=True)
-                elif usar_payload:
-                    print(f" {c('2', '·')} {fachada}#{destino}  {porta}  {ms}ms  {detalhe}", flush=True)
-                elif ok:
-                    print(f" {c('1;32', '✔')} {fachada}#{destino}  {porta}  {ms}ms  {detalhe}", flush=True)
-
+                if not respostas:
+                    falhas["conectou, sem resposta HTTP"] += 1
+                    return
+                detalhe = resumo_respostas(respostas)
+                ok = any(status_ok(cod, ranges) for cod, _ in respostas)
+                mostrar(ok, fachada, destino, porta, host, sni, ms, detalhe)
                 if ok:
-                    resultados.append((fachada, destino, porta, ms, detalhe))
+                    resultados.append((fachada, destino, porta, host, sni, ms, detalhe))
+                else:
+                    falhas["respondeu fora do status esperado"] += 1
         except Exception as exc:
-            print(f" {c('2', '·')} {fachada}#{destino}  {porta}  {type(exc).__name__}", flush=True)
+            falhas["timeout" if isinstance(exc, (asyncio.TimeoutError, TimeoutError))
+                   else f"não conectou ({type(exc).__name__})"] += 1
         finally:
             await fechar(w)
 
-    print(f"\n Testando {len(itens)} entrada(s) em {len(portas)} porta(s)...\n")
-    await asyncio.gather(*(um(f, d, p) for f, d in itens for p in portas))
+    print()
+    line("═", "1;36")
+    info_row("IPs", f"{len(itens)} entrada(s)")
+    info_row("Portas", " + ".join(map(str, portas)))
+    if usar_payload:
+        info_row("Hosts", f"{len(cfg['hosts'])}   SNIs: {len(cfg['snis'])}")
+        info_row("Status", args.status)
+    info_row("Testes", fmt(len(testes)))
+    line("═", "1;36")
+    print()
+    await asyncio.gather(*(um(*t) for t in testes))
+
+    # ---------- resultado agrupado por IP ----------
+    print()
+    line("═", "1;36")
+    print(c("1", f" RESULTADO: {len(resultados)} combinação(ões) funcionaram de {fmt(len(testes))}"))
+    line("═", "1;36")
+    grupos = {}
+    for fachada, destino, porta, host, sni, ms, detalhe in sorted(resultados, key=lambda x: x[5]):
+        grupos.setdefault((fachada, destino, porta), []).append((host, sni, ms, detalhe))
+    for (fachada, destino, porta), lst in grupos.items():
+        print(f" {c('1;32', '✔')} {c('1', f'{fachada}#{destino}')}  {c('1;36', f':{porta}')}")
+        for host, sni, ms, detalhe in lst:
+            hs = host if host == sni or porta == 80 else f"{host} · SNI {sni}"
+            print(c("35", f"     {hs[:34]}") + c("2", f"  {ms}ms  ") + c("32", detalhe))
+    if falhas:
+        print()
+        print(c("2", " Sem sucesso: " + ", ".join(f"{k} {v}" for k, v in falhas.most_common(4))))
+
     caminho = output_path("dropnet_proxies_testados.txt")
     with open(caminho, "w", encoding="utf-8") as f:
-        for fachada, destino, porta, ms, detalhe in sorted(resultados, key=lambda x: x[3]):
-            f.write(f"{fachada}#{destino};{porta};{ms}ms;{detalhe}\n")
-    print(f"\n Resultado: {len(resultados)} teste(s) aprovado(s) de {len(itens) * len(portas)}." )
-    print(f" Arquivo: {caminho}\n")
+        for fachada, destino, porta, host, sni, ms, detalhe in sorted(resultados, key=lambda x: x[5]):
+            f.write(f"{fachada}#{destino};{porta};{host};{sni};{ms}ms;{detalhe}\n")
+    print(f"\n Arquivo: {caminho}\n")
 
 
 # ============================ menu ============================
@@ -2153,7 +2280,12 @@ def interactive(base):
     line()
     modo_inicio = escolher("Modo", ("1", "2"), "1")
     if modo_inicio == "2":
-        asyncio.run(testar_proxies_existentes(base))
+        cfg = configurar_teste_proxies(base)
+        if cfg:
+            try:
+                asyncio.run(testar_proxies_existentes(cfg))
+            except KeyboardInterrupt:
+                print(c("33", "\n Teste interrompido."))
         return "menu_only"
     provs = load_providers(base.providers)
     while True:
@@ -2232,6 +2364,7 @@ def interactive(base):
         args.max_ips = ask_num("Quantos IPs testar (0 = todos)", args.max_ips)
         args.threads = ask_num("Threads", args.threads)
         args.timeout = ask_num("Timeout (s)", args.timeout, float)
+        args.espera_extra = ask_num("Espera por respostas seguidas, ex. 403>101>200 (s)", args.espera_extra, float)
         args.ranking = ask("Ranking de latência dos IPs achados? (s/n)", "s").lower().startswith("s")
         if not args.max_ips:
             print(c("33", " Modo rápido testa amostras de cada /24 e pode perder IPs isolados."))
@@ -2347,121 +2480,4 @@ def build_parser():
                     help="proxy: ssl=443, ssh=80, ambos=80+443 (testa de verdade e lista só quem funcionou)")
     c_.add_argument("--payload-ssh", help="payload da porta 80 (aceita [split])")
     c_.add_argument("--tcp", action="store_true", help="só testa se a porta abre (sem payload)")
-    c_.add_argument("--tls", action="store_true", help="usar TLS/SNI (modo payload)")
-    c_.add_argument("--sni", help="SNI / valor do [host] no payload")
-    c_.add_argument("--host", help="valor do [host] no payload (modo combo; separado da SNI)")
-    c_.add_argument("--hosts-lista", help="arquivo com vários Hosts (um por linha); sorteia um diferente a cada requisição em vez de usar sempre o mesmo")
-    c_.add_argument("--sni-lista", help="arquivo com várias SNIs (um por linha); sorteia uma diferente a cada requisição em vez de usar sempre a mesma")
-    c_.add_argument("--tls-version", choices=TLS_VERSIONS)
-    c_.add_argument("--proxy", help="proxy HTTP CONNECT host:porta")
-    c_.add_argument("--payload", default=DEFAULT_PAYLOAD, help="use [crlf], [lf], [host], [ip], [ua], [method], [rotate=a;b]")
-    c_.add_argument("--status", default="101;200", help='ex.: "101;200;301-302"')
-
-    r = p.add_argument_group("desempenho / saída")
-    r.add_argument("--threads", type=int, default=100, help="IPs testados ao mesmo tempo")
-    r.add_argument("--timeout", type=float, default=2.0, help="timeout em segundos")
-    r.add_argument("-o", "--output", default="", help="prefixo dos arquivos de saída")
-    r.add_argument("--debug", action="store_true", help="mostra o motivo de cada falha")
-    r.add_argument("--avancado", action="store_true", help="no menu, pergunta mais opções")
-    r.add_argument("--confirmar", action="store_true", help="depois do TCP, confirma de verdade (status) em quem abriu porta")
-    r.add_argument("--tentativas", type=int, default=1, help="tentativas por IP na confirmação (rede instável)")
-    r.add_argument("--diag", nargs="+", metavar="IP", help="testa várias formas de requisição nesses IPs")
-    r.add_argument("--ranking", action="store_true", help="depois do scan, mede a latência dos IPs achados e ordena")
-    r.add_argument("--rapido", action="store_true", help="modo rápido: testa amostras de cada /24 e só varre blocos que responderam (pode perder IPs isolados)")
-    r.add_argument("--rapido-amostras", type=int, default=3, help="amostras por bloco /24 no modo rápido")
-    r.add_argument("--retomar", action="store_true", help="retoma automaticamente o último scan interrompido")
-    r.add_argument("--novo", action="store_true", help="ignora o progresso salvo e começa do zero")
-    r.add_argument("--no-color", action="store_true", help="sem cores")
-
-    g2 = p.add_argument_group("gerar payload / testar hosts / perfis")
-    g2.add_argument("--gerar-payload", metavar="IP", help="testa várias variações de payload nesse IP e mostra as que funcionaram")
-    g2.add_argument("--testar-hosts", metavar="ARQUIVO", help="testa uma lista de hosts/SNI (um por linha) com o --payload atual; use com --ip")
-    g2.add_argument("--ip", help="IP alvo para --testar-hosts")
-    g2.add_argument("--porta-gerar", type=int, default=443, help="porta usada por --gerar-payload / --testar-hosts")
-    g2.add_argument("--split-delay", type=float, default=2.0, help="segundos de espera no [delay_split] (padrão 2.0)")
-    g2.add_argument("--salvar-perfil", metavar="NOME", help="salva modo/host/sni/payload atuais como um perfil de rede")
-    g2.add_argument("--usar-perfil", metavar="NOME", help="carrega um perfil salvo (modo/host/sni/payload) antes de rodar")
-    g2.add_argument("--listar-perfis", action="store_true", help="lista os perfis salvos e sai")
-    return p
-
-
-def main():
-    args = build_parser().parse_args()
-    if args.no_color:
-        UI.color = False
-    carregar_pools(args)
-
-    if args.diag:
-        try:
-            asyncio.run(diag(args))
-        except KeyboardInterrupt:
-            pass
-        return
-
-    if args.listar_perfis:
-        listar_perfis()
-        return
-
-    if args.salvar_perfil:
-        if not args.modo:
-            sys.exit("--salvar-perfil precisa de --modo (ssl/ssh/ambos) com payload/host/sni definidos.")
-        perfil_salvar(args, args.salvar_perfil)
-        return
-
-    if args.gerar_payload:
-        args.ip = args.gerar_payload
-        try:
-            asyncio.run(gerar_payload(args))
-        except KeyboardInterrupt:
-            pass
-        return
-
-    if args.testar_hosts:
-        if not args.ip:
-            sys.exit("--testar-hosts precisa de --ip IP.")
-        try:
-            asyncio.run(testar_hosts(args))
-        except KeyboardInterrupt:
-            pass
-        return
-
-    if args.usar_perfil:
-        perfil_carregar(args, args.usar_perfil)
-
-    if not (args.cidr or args.cidr_file or args.provider or args.hosts):
-        try:
-            while True:
-                a = interactive(args)
-                if a is None:
-                    break
-                if a == "menu_only":
-                    continue
-                try:
-                    asyncio.run(run_combo(a) if a.modo else run(a))
-                except KeyboardInterrupt:
-                    pass
-                try:
-                    r = input(c("2", " Enter = voltar ao menu  ·  q = sair: ")).strip().lower()
-                except EOFError:
-                    break
-                if r in ("q", "sair", "0"):
-                    break
-        except KeyboardInterrupt:
-            pass
-        print(c("2", "\n Até mais.\n"))
-        return
-
-    try:
-        if args.modo:
-            aplicar_padroes_combo(args)
-            args.port_ssl, args.port_ssh = 443, 80
-            args.tentativas = max(1, args.tentativas)
-            asyncio.run(run_combo(args))
-        else:
-            asyncio.run(run(args))
-    except KeyboardInterrupt:
-        pass
-
-
-if __name__ == "__main__":
-    main()
+    c_.add_argument
