@@ -331,11 +331,11 @@ def start_scanner():
             print(f"[ERRO] {script.name} não encontrado.")
             pause()
             continue
-        print(f"\\nIniciando {label}...\\n")
+        print(f"Iniciando {label}...")
         try:
             subprocess.run([PYTHON, str(script)], cwd=str(BASE), check=False)
         except KeyboardInterrupt:
-            print("\\nScanner interrompido pelo usuário.")
+            print("Scanner interrompido pelo usuário.")
         OUT.mkdir(parents=True, exist_ok=True)
         for file in BASE.glob("dropnet_*.txt"):
             try:
