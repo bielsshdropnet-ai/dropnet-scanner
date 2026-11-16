@@ -179,7 +179,7 @@ def edit_proxies():
 
 def edit_sni():
     """Aceita um ou vários SNIs: digite um, ENTER, digite outro... Termine com linha vazia."""
-    print("\nSNI - digite um e aperte ENTER; pode repetir para adicionar mais de um")
+    print("\nSUA SNI AQUI- digite um e aperte ENTER; pode repetir para adicionar mais de um")
     print("(ENTER)")
     lines = []
     try:
