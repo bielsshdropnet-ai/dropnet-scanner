@@ -311,8 +311,8 @@ def start_scanner():
     while True:
         os.system("clear")
         print(f"{BOLD}{CYAN}====== ESCOLHA O SCANNER ======{RESET}")
-        print("1) DROPNET IPv4 SCANNER (original)")
-        print("2) DROPNET HOST SCANNER")
+        print("1) DROPNET IPv4 SCANNER (CDN)")
+        print("2) DROPNET HOST SCANNER (PROXY)")
         print("0) Voltar")
         choice = input("Escolha uma opção: ").strip()
         if choice == "1":
