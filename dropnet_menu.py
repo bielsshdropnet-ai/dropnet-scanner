@@ -310,10 +310,15 @@ def start_scanner():
     """Submenu de scanners; mantém o IPv4 original como opção 1."""
     while True:
         os.system("clear")
+        
         print(f"{BOLD}{CYAN}====== ESCOLHA O SCANNER ======{RESET}")
+        
         print("1) DROPNET IPv4 SCANNER (CDN)")
+        
         print("2) DROPNET HOST SCANNER (PROXY)")
+        
         print("0) Voltar")
+        
         choice = input("Escolha uma opção: ").strip()
         if choice == "1":
             script = BASE / "ipv4scanner.py"
