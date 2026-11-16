@@ -310,7 +310,6 @@ def start_scanner():
     """Submenu de scanners; mantém o IPv4 original como opção 1."""
     while True:
         os.system("clear")
-        
         print("\n\n")
         print(f"{BOLD}{CYAN}====== ESCOLHA O SCANNER ======{RESET}")
         print("1) DROPNET IPv4 SCANNER (CDN)")
