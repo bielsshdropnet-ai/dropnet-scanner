@@ -312,9 +312,7 @@ def start_scanner():
         os.system("clear")
         
         print("")
-        print(f"{BOLD}{CYAN}╔══════════════════════════════╗
-║       ESCOLHA O SCANNER      ║
-╚══════════════════════════════╝{RESET}")
+        print(f"{BOLD}{CYAN}====== SCANNER MENU ======{RESET}")
         print("1) DROPNET IPv4 SCANNER (CDN)")
         print("2) DROPNET HOST SCANNER (PROXY)")
         print("0) Voltar")
