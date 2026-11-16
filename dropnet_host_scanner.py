@@ -152,9 +152,7 @@ def edit_payload():
 
 def edit_proxies():
     """Aceita proxies coladas uma embaixo da outra ou separadas por #."""
-    print("\nPROXIES - só o IP (a porta é a que você escolheu no menu)")
-    print("Cole uma embaixo da outra ou separadas por #")
-    print("Termine com uma linha vazia (ENTER). ENTER direto mantém as atuais.")
+    print("\nPROXIES - Cole uma embaixo da outra ou separadas por #(ENTER)")
     lines = []
     try:
         while True:
