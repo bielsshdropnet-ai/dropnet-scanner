@@ -137,7 +137,7 @@ def show_panel():
 
 def edit_line(label, current=""):
     print(f"\n{label}")
-    value = input(f"> {current}\nNovo valor (ENTER mantém): ").strip()
+    value = input(f"> {current}SEU HOST AQUI (ENTER): ").strip()
     return value if value else current
 
 
