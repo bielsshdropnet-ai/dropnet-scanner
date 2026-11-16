@@ -142,8 +142,7 @@ def edit_line(label, current=""):
 
 
 def edit_payload():
-    print("\nPAYLOAD - cole tudo em uma linha e aperte ENTER para salvar")
-    print("Use [host], [crlf], [lf] e [method] quando necessário.")
+    print("\nPAYLOAD - aqui e aperte (ENTER)")
     try:
         value = input("> ").strip()
     except (EOFError, KeyboardInterrupt):
