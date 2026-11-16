@@ -314,7 +314,7 @@ def start_scanner():
         print("1) DROPNET IPv4 SCANNER (original)")
         print("2) DROPNET HOST SCANNER")
         print("0) Voltar")
-        choice = input("  Escolha uma opção: ").strip()
+        choice = input("Escolha uma opção: ").strip()
         if choice == "1":
             script = BASE / "ipv4scanner.py"
             label = "DROPNET IPv4 SCANNER"
@@ -324,11 +324,11 @@ def start_scanner():
         elif choice == "0":
             return
         else:
-            print("\\nOpção inválida.")
+            print("Opção inválida.")
             time.sleep(1)
             continue
         if not script.is_file():
-            print(f"\\n[ERRO] {script.name} não encontrado.")
+            print(f"[ERRO] {script.name} não encontrado.")
             pause()
             continue
         print(f"\\nIniciando {label}...\\n")
