@@ -95,7 +95,7 @@ def header():
     print(C + "╔══════════════════════════════════════╗")
     print("║        DROPNET HOST SCANNER          ║")
     print("╚══════════════════════════════════════╝" + X)
-    print(D + f" Painel de testes em redes autorizadas  v{VERSION}" + X)
+    print(D + f" DROPNET OFICIAL v{VERSION}" + X)
 
 
 def show_panel():
@@ -152,7 +152,7 @@ def edit_payload():
 
 def edit_proxies():
     """Aceita proxies coladas uma embaixo da outra ou separadas por #."""
-    print("\nPROXIES - Cole uma embaixo da outra ou separadas por #(ENTER)")
+    print("\nPROXIES # (ENTER)")
     lines = []
     try:
         while True:
