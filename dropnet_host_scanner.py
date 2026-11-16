@@ -136,7 +136,7 @@ def show_panel():
 
 
 def edit_line(label, current=""):
-    print(f"\n{label CDN}")
+    print(f"\n{label}")
     value = input(f"> {current}SEU HOST AQUI (ENTER): ").strip()
     return value if value else current
 
