@@ -312,11 +312,16 @@ def start_scanner():
         os.system("clear")
         
         print("")
-        print(f"{BOLD}{CYAN}====== SCANNER MENU ======{RESET}")
-        print("1) DROPNET IPv4 SCANNER (CDN)")
-        print("2) DROPNET HOST SCANNER (PROXY)")
-        print("0) Voltar")
-        choice = input("Escolha uma opção: ").strip()
+        print(f"{BOLD}{CYAN}├{'─' * inner}┤{RESET}")
+        print(f"{BOLD}{CYAN}│{RESET}{fit('SCANNER MENU'.center(inner), inner)}{BOLD}{CYAN}│{RESET}")
+        print(f"{BOLD}{CYAN}├{'─' * inner}┤{RESET}")
+        print(f"{CYAN}│{RESET}{fit('1) DROPNET IPv4 SCANNER (CDN)', inner)}{CYAN}│{RESET}")
+        print(f"{CYAN}│{RESET}{fit('2) DROPNET HOST SCANNER (PROXY)', inner)}{CYAN}│{RESET}")
+        print(f"{CYAN}│{RESET}{fit('0) Voltar', inner)}{CYAN}│{RESET}")
+        print(f"{BOLD}{CYAN}└{'─' * inner}┘{RESET}")
+
+        choice = input("\n  Escolha uma opção: ").strip()
+
         if choice == "1":
             script = BASE / "ipv4scanner.py"
             label = "DROPNET IPv4 SCANNER"
