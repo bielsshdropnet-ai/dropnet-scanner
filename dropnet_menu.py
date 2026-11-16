@@ -314,7 +314,7 @@ def start_scanner():
         print("1) DROPNET IPv4 SCANNER (original)")
         print("2) DROPNET HOST SCANNER")
         print("0) Voltar")
-        choice = input("\\n  Escolha uma opção: ").strip()
+        choice = input("  Escolha uma opção: ").strip()
         if choice == "1":
             script = BASE / "ipv4scanner.py"
             label = "DROPNET IPv4 SCANNER"
