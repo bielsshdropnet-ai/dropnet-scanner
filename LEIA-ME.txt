@@ -1,0 +1,23 @@
+DROPNET SCANNER V8 — atualizador completo
+
+Instalação inicial: extraia o ZIP, entre na pasta dropnet-scanner-main e execute bash instalar.sh.
+
+Atualização: no menu, escolha 3. O programa consulta o commit da branch main do repositório GitHub configurado. Se houver novidade, escolha S para baixar e substituir o conjunto completo de arquivos do projeto. Um backup da pasta anterior é mantido em ~/dropnet-scanner.backup.
+
+Os resultados em ~/storage/downloads/DROPNET-SCANNER ficam fora da pasta do programa e não são substituídos pelo atualizador.
+
+
+NOVA VERSAO COM DOIS SCANNERS
+- Opção 1 no menu principal abre a seleção de scanners.
+- Scanner 1: ipv4scanner.py (original, preservado).
+- Scanner 2: dropnet_host_scanner.py (novo DROPNET HOST SCANNER).
+- O instalador instala os dois scanners quando os arquivos estão no pacote.
+
+
+ATUALIZAÇÃO V9 — PAINEL E BGP INTELLIGENCE
+- A tela inicial foi preservada. A seleção de scanners (segunda tela) recebeu um painel mais organizado.
+- Scanner 4: dropnet_bgp_intelligence.py. Consulta passiva ao Hurricane Electric BGP Toolkit por ASN, IP, prefixo CIDR e domínio/DNS.
+- Os resultados são exibidos no Termux e podem ser salvos em ~/storage/downloads/DROPNET-SCANNER.
+- A consulta depende da disponibilidade e dos limites de acesso do bgp.he.net. Não é um scanner de proxy nem executa varredura de portas.
+
+Para usar: extraia o ZIP atualizado e execute o instalador normalmente (ou substitua a pasta do projeto pela nova versão).
