@@ -249,7 +249,7 @@ def device_status():
 
 
 def terminal_width():
-    return max(30, min(shutil.get_terminal_size((40, 24)).columns, 60))
+    return max(30, min(shutil.get_terminal_size((40, 24)).columns, 72))
 
 
 def fit(text, width):
